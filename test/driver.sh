@@ -16,7 +16,7 @@ check() {
 
 # -o
 rm -f $tmp/out
-./chibicc -c -o $tmp/out $tmp/empty.c
+build/chibicc -c -o $tmp/out $tmp/empty.c
 [ -f $tmp/out ]
 check -o
 
