@@ -1,1208 +1,1959 @@
-// This file implements the C preprocessor.
-//
-// The preprocessor takes a list of tokens as an input and returns a
-// new list of tokens as an output.
-//
-// The preprocessing language is designed in such a way that that's
-// guaranteed to stop even if there is a recursive macro.
-// Informally speaking, a macro is applied only once for each token.
-// That is, if a macro token T appears in a result of direct or
-// indirect macro expansion of T, T won't be expanded any further.
-// For example, if T is defined as U, and U is defined as T, then
-// token T is expanded to U and then to T and the macro expansion
-// stops at that point.
-//
-// To achieve the above behavior, we attach for each token a set of
-// macro names from which the token is expanded. The set is called
-// "hideset". Hideset is initially empty, and every time we expand a
-// macro, the macro name is added to the resulting tokens' hidesets.
-//
-// The above macro expansion algorithm is explained in this document
-// written by Dave Prossor, which is used as a basis for the
-// standard's wording:
-// https://github.com/rui314/chibicc/wiki/cpp.algo.pdf
-
 #include "chibicc.h"
 
+/**
+ * @brief Represents a macro parameter.
+ *
+ * This structure is used to store information about a parameter of a macro.
+ * It includes the name of the parameter and a pointer to the next parameter,
+ * allowing the parameters to form a linked list.
+ */
 typedef struct MacroParam MacroParam;
 struct MacroParam {
-  MacroParam *next;
-  char *name;
+	MacroParam *	next;   /**< Pointer to the next macro parameter in the list. */
+	char *		name;   /**< The name of the macro parameter. */
 };
 
+/**
+ * @brief Represents a macro argument.
+ *
+ * This structure is used to store information about an argument passed to a macro.
+ * It includes the name of the argument, a flag indicating whether it's a variadic
+ * argument (`is_va_args`), and the token that represents the argument in the source code.
+ */
 typedef struct MacroArg MacroArg;
 struct MacroArg {
-  MacroArg *next;
-  char *name;
-  bool is_va_args;
-  Token *tok;
+	MacroArg *	next;           /**< Pointer to the next macro argument in the list. */
+	char *		name;           /**< The name of the macro argument. */
+	bool		is_va_args;     /**< Flag indicating whether this argument is part of a variadic argument list. */
+	Token *		tok;            /**< The token representing the argument. */
 };
 
+/**
+ * @brief Function pointer type for macro handler functions.
+ *
+ * This defines a type for a function that handles macro expansion. The function
+ * takes a token as input and returns a token as output.
+ */
 typedef Token *macro_handler_fn(Token *);
 
+/**
+ * @brief Represents a macro.
+ *
+ * This structure is used to store information about a macro, including its name,
+ * whether it's an object-like macro or a function-like macro, its parameters,
+ * the body of the macro, and its handler function (if any).
+ */
 typedef struct Macro Macro;
 struct Macro {
-  char *name;
-  bool is_objlike; // Object-like or function-like
-  MacroParam *params;
-  char *va_args_name;
-  Token *body;
-  macro_handler_fn *handler;
+	char *			name;           /**< The name of the macro. */
+	bool			is_objlike;     /**< Flag indicating whether the macro is an object-like macro. */
+	MacroParam *		params;         /**< A linked list of the macro's parameters (if it's a function-like macro). */
+	char *			va_args_name;   /**< The name of the variadic argument (if applicable). */
+	Token *			body;           /**< The body of the macro, represented as a token. */
+	macro_handler_fn *	handler;        /**< A handler function for expanding the macro (optional). */
 };
 
-// `#if` can be nested, so we use a stack to manage nested `#if`s.
+/**
+ * @brief Represents a conditional inclusion block (e.g., #if, #elif, #else).
+ *
+ * This structure is used to represent a conditional inclusion block, storing information
+ * about the conditional context, the token for the condition, and whether the block
+ * has been included or not.
+ */
 typedef struct CondIncl CondIncl;
 struct CondIncl {
-  CondIncl *next;
-  enum { IN_THEN, IN_ELIF, IN_ELSE } ctx;
-  Token *tok;
-  bool included;
+	CondIncl *	next;                   /**< Pointer to the next conditional inclusion block in the list. */
+	enum { IN_THEN, IN_ELIF, IN_ELSE } ctx; /**< The current context of the conditional block (THEN, ELIF, ELSE). */
+	Token *		tok;                    /**< The token representing the condition. */
+	bool		included;               /**< Flag indicating whether the block has been included. */
 };
 
+/**
+ * @brief Represents a symbol to be hidden from the preprocessor.
+ *
+ * This structure is used to represent a set of symbols that should be hidden
+ * from the preprocessor, usually for conditional processing or other reasons.
+ */
 typedef struct Hideset Hideset;
 struct Hideset {
-  Hideset *next;
-  char *name;
+	Hideset *	next;   /**< Pointer to the next hideset in the list. */
+	char *		name;   /**< The name of the symbol to be hidden. */
 };
 
+/**
+ * @brief A hashmap of macros.
+ *
+ * This global variable stores the mapping of macro names to their corresponding
+ * macro definitions. It is used to look up macros during the preprocessing phase.
+ */
 static HashMap macros;
+
+/**
+ * @brief A linked list of conditional inclusion blocks.
+ *
+ * This global variable stores the list of conditional inclusion blocks, such as
+ * those generated by `#if`, `#elif`, and `#else` directives.
+ */
 static CondIncl *cond_incl;
+
+/**
+ * @brief A hashmap of "pragma once" directives.
+ *
+ * This global variable stores a hashmap of "pragma once" directives, ensuring that
+ * files are included only once.
+ */
 static HashMap pragma_once;
+
+/**
+ * @brief Index to track the next include statement.
+ *
+ * This global variable tracks the next index to be used for including files.
+ */
 static int include_next_idx;
 
+/**
+ * @brief Preprocesses a token.
+ *
+ * This function performs additional preprocessing on a token, modifying it if needed.
+ *
+ * @param tok The token to preprocess.
+ *
+ * @return The preprocessed token.
+ */
 static Token *preprocess2(Token *tok);
+
+/**
+ * @brief Finds a macro corresponding to a token.
+ *
+ * This function searches for a macro corresponding to the given token.
+ *
+ * @param tok The token to search for as a macro.
+ *
+ * @return The corresponding macro, or NULL if no macro is found.
+ */
 static Macro *find_macro(Token *tok);
 
-static bool is_hash(Token *tok) {
-  return tok->at_bol && equal(tok, "#");
+/**
+ * @brief Checks if a token is a preprocessor hash (`#`).
+ *
+ * This function checks whether the given token is a preprocessor hash (`#`)
+ * and is at the beginning of a line (i.e., at the beginning of a directive).
+ *
+ * @param tok The token to check.
+ *
+ * @return True if the token is a preprocessor hash (`#`) at the beginning of a line, false otherwise.
+ */
+static bool is_hash(Token *tok)
+{
+	return tok->at_bol && equal(tok, "#");
 }
 
-// Some preprocessor directives such as #include allow extraneous
-// tokens before newline. This function skips such tokens.
-static Token *skip_line(Token *tok) {
-  if (tok->at_bol)
-    return tok;
-  warn_tok(tok, "extra token");
-  while (tok->at_bol)
-    tok = tok->next;
-  return tok;
+/**
+ * @brief Skips a line of tokens.
+ *
+ * This function skips over the current token until it reaches the beginning of the next line.
+ * If the current token is already at the beginning of a line, it simply returns the token.
+ * Otherwise, it generates a warning for an extra token and continues to skip tokens until it
+ * finds the beginning of the next line.
+ *
+ * @param tok The token to start from.
+ *
+ * @return The token at the beginning of the next line, or the current token if it's already at the start of the line.
+ */
+static Token *skip_line(Token *tok)
+{
+	if (tok->at_bol)
+		return tok;
+	warn_tok(tok, "extra token");
+	while (tok->at_bol)
+		tok = tok->next;
+	return tok;
 }
 
-static Token *copy_token(Token *tok) {
-  Token *t = calloc(1, sizeof(Token));
-  *t = *tok;
-  t->next = NULL;
-  return t;
+/**
+ * @brief Creates a copy of a token.
+ *
+ * This function creates a new token and copies the contents of the given token into the new token.
+ * The new token is initialized with the same properties, but with a `NULL` pointer for the `next` token.
+ *
+ * @param tok The token to copy.
+ *
+ * @return A new token that is a copy of the given token.
+ */
+static Token *copy_token(Token *tok)
+{
+	Token *t = calloc(1, sizeof(Token));
+
+	*t = *tok;
+	t->next = NULL;
+	return t;
 }
 
-static Token *new_eof(Token *tok) {
-  Token *t = copy_token(tok);
-  t->kind = TK_EOF;
-  t->len = 0;
-  return t;
+/**
+ * @brief Creates a new EOF (End Of File) token.
+ *
+ * This function creates a new token representing the end of a file. It copies the properties of the
+ * given token and sets its kind to `TK_EOF`, indicating the end of the file. The length of the token
+ * is set to 0.
+ *
+ * @param tok The token to copy (used for reference, but the EOF token will have a different kind).
+ *
+ * @return A new token representing the end of the file.
+ */
+static Token *new_eof(Token *tok)
+{
+	Token *t = copy_token(tok);
+
+	t->kind = TK_EOF;
+	t->len = 0;
+	return t;
 }
 
-static Hideset *new_hideset(char *name) {
-  Hideset *hs = calloc(1, sizeof(Hideset));
-  hs->name = name;
-  return hs;
+/**
+ * @brief Creates a new hideset with a given name.
+ *
+ * This function creates a new `Hideset` structure and initializes its `name` field with the
+ * provided string. The next pointer of the new hideset is set to `NULL`.
+ *
+ * @param name The name to assign to the hideset.
+ *
+ * @return A new `Hideset` structure with the given name.
+ */
+static Hideset *new_hideset(char *name)
+{
+	Hideset *hs = calloc(1, sizeof(Hideset));
+
+	hs->name = name;
+	return hs;
 }
 
-static Hideset *hideset_union(Hideset *hs1, Hideset *hs2) {
-  Hideset head = {};
-  Hideset *cur = &head;
+/**
+ * @brief Combines two hidesets into one by linking them together.
+ *
+ * This function takes two hidesets and creates a new hideset that is the union of the two.
+ * It copies the elements of the first hideset into a new list and then appends the second hideset
+ * to the resulting list. The new hideset is returned.
+ *
+ * @param hs1 The first hideset.
+ * @param hs2 The second hideset.
+ *
+ * @return A new hideset that contains all the elements of both `hs1` and `hs2`.
+ */
+static Hideset *hideset_union(Hideset *hs1, Hideset *hs2)
+{
+	Hideset head = {};
+	Hideset *cur = &head;
 
-  for (; hs1; hs1 = hs1->next)
-    cur = cur->next = new_hideset(hs1->name);
-  cur->next = hs2;
-  return head.next;
+	for (; hs1; hs1 = hs1->next)
+		cur = cur->next = new_hideset(hs1->name);
+	cur->next = hs2;
+	return head.next;
 }
 
-static bool hideset_contains(Hideset *hs, char *s, int len) {
-  for (; hs; hs = hs->next)
-    if (strlen(hs->name) == len && !strncmp(hs->name, s, len))
-      return true;
-  return false;
+/**
+ * @brief Checks if a hideset contains a name.
+ *
+ * This function checks if a given hideset contains an element with the specified name. It compares
+ * the length and the contents of the name to determine if a match is found.
+ *
+ * @param hs The hideset to search.
+ * @param s The name to check for.
+ * @param len The length of the name to check.
+ *
+ * @return `true` if the hideset contains the name, `false` otherwise.
+ */
+static bool hideset_contains(Hideset *hs, char *s, int len)
+{
+	for (; hs; hs = hs->next)
+		if (strlen(hs->name) == len && !strncmp(hs->name, s, len))
+			return true;
+	return false;
 }
 
-static Hideset *hideset_intersection(Hideset *hs1, Hideset *hs2) {
-  Hideset head = {};
-  Hideset *cur = &head;
+/**
+ * @brief Computes the intersection of two hidesets.
+ *
+ * This function creates a new hideset that contains only the elements that appear in both
+ * `hs1` and `hs2`. It compares each element in `hs1` with the elements in `hs2` and keeps
+ * the ones that are present in both. The resulting hideset is returned.
+ *
+ * @param hs1 The first hideset.
+ * @param hs2 The second hideset.
+ *
+ * @return A new hideset that contains the intersection of `hs1` and `hs2`.
+ */
+static Hideset *hideset_intersection(Hideset *hs1, Hideset *hs2)
+{
+	Hideset head = {};
+	Hideset *cur = &head;
 
-  for (; hs1; hs1 = hs1->next)
-    if (hideset_contains(hs2, hs1->name, strlen(hs1->name)))
-      cur = cur->next = new_hideset(hs1->name);
-  return head.next;
+	for (; hs1; hs1 = hs1->next)
+		if (hideset_contains(hs2, hs1->name, strlen(hs1->name)))
+			cur = cur->next = new_hideset(hs1->name);
+	return head.next;
 }
 
-static Token *add_hideset(Token *tok, Hideset *hs) {
-  Token head = {};
-  Token *cur = &head;
+/**
+ * @brief Adds a hideset to the hideset of each token in a list.
+ *
+ * This function iterates through the tokens starting from `tok` and for each token, it
+ * copies it and adds the given hideset to its `hideset` field by using the union of
+ * the current hideset and the provided hideset. The modified tokens are linked together
+ * into a new token list, which is returned.
+ *
+ * @param tok The list of tokens to which the hideset will be added.
+ * @param hs The hideset to be added to each token's `hideset` field.
+ *
+ * @return A new token list with the hideset added to each token.
+ */
+static Token *add_hideset(Token *tok, Hideset *hs)
+{
+	Token head = {};
+	Token *cur = &head;
 
-  for (; tok; tok = tok->next) {
-    Token *t = copy_token(tok);
-    t->hideset = hideset_union(t->hideset, hs);
-    cur = cur->next = t;
-  }
-  return head.next;
+	for (; tok; tok = tok->next) {
+		Token *t = copy_token(tok);
+		t->hideset = hideset_union(t->hideset, hs);
+		cur = cur->next = t;
+	}
+	return head.next;
 }
 
-// Append tok2 to the end of tok1.
-static Token *append(Token *tok1, Token *tok2) {
-  if (tok1->kind == TK_EOF)
-    return tok2;
+/**
+ * @brief Appends one list of tokens to another.
+ *
+ * This function appends the list of tokens starting from `tok2` to the end of the
+ * list starting from `tok1`. The function returns the new list, which is a
+ * concatenation of both token lists.
+ *
+ * @param tok1 The first list of tokens.
+ * @param tok2 The second list of tokens to be appended to `tok1`.
+ *
+ * @return A new list of tokens, which is the result of appending `tok2` to `tok1`.
+ */
+static Token *append(Token *tok1, Token *tok2)
+{
+	if (tok1->kind == TK_EOF)
+		return tok2;
 
-  Token head = {};
-  Token *cur = &head;
+	Token head = {};
+	Token *cur = &head;
 
-  for (; tok1->kind != TK_EOF; tok1 = tok1->next)
-    cur = cur->next = copy_token(tok1);
-  cur->next = tok2;
-  return head.next;
+	for (; tok1->kind != TK_EOF; tok1 = tok1->next)
+		cur = cur->next = copy_token(tok1);
+	cur->next = tok2;
+	return head.next;
 }
 
-static Token *skip_cond_incl2(Token *tok) {
-  while (tok->kind != TK_EOF) {
-    if (is_hash(tok) &&
-        (equal(tok->next, "if") || equal(tok->next, "ifdef") ||
-         equal(tok->next, "ifndef"))) {
-      tok = skip_cond_incl2(tok->next->next);
-      continue;
-    }
-    if (is_hash(tok) && equal(tok->next, "endif"))
-      return tok->next->next;
-    tok = tok->next;
-  }
-  return tok;
+/**
+ * @brief Skips over conditional inclusion directives in the token list.
+ *
+ * This function skips over conditional inclusion directives (`#if`, `#ifdef`,
+ * `#ifndef`, `#endif`) in the token list starting from `tok`. It processes the
+ * tokens recursively, handling nested conditionals, and returns the token list
+ * that comes after the last `#endif` directive.
+ *
+ * @param tok The list of tokens to process.
+ *
+ * @return A token list that comes after the last `#endif` directive.
+ */
+static Token *skip_cond_incl2(Token *tok)
+{
+	while (tok->kind != TK_EOF) {
+		if (is_hash(tok) &&
+		    (equal(tok->next, "if") || equal(tok->next, "ifdef") ||
+		     equal(tok->next, "ifndef"))) {
+			tok = skip_cond_incl2(tok->next->next);
+			continue;
+		}
+		if (is_hash(tok) && equal(tok->next, "endif"))
+			return tok->next->next;
+		tok = tok->next;
+	}
+	return tok;
 }
 
-// Skip until next `#else`, `#elif` or `#endif`.
-// Nested `#if` and `#endif` are skipped.
-static Token *skip_cond_incl(Token *tok) {
-  while (tok->kind != TK_EOF) {
-    if (is_hash(tok) &&
-        (equal(tok->next, "if") || equal(tok->next, "ifdef") ||
-         equal(tok->next, "ifndef"))) {
-      tok = skip_cond_incl2(tok->next->next);
-      continue;
-    }
+/**
+ * @brief Skips over conditional inclusion directives in the token list.
+ *
+ * This function processes conditional inclusion directives like `#if`, `#ifdef`,
+ * `#ifndef`, `#elif`, `#else`, and `#endif`. It recursively handles nested
+ * conditionals and skips over the tokens corresponding to these directives. The
+ * function returns the token list after the last `#endif` or the next non-conditional
+ * token.
+ *
+ * @param tok The list of tokens to process.
+ *
+ * @return The token list after the last conditional inclusion or directive.
+ */
+static Token *skip_cond_incl(Token *tok)
+{
+	while (tok->kind != TK_EOF) {
+		if (is_hash(tok) &&
+		    (equal(tok->next, "if") || equal(tok->next, "ifdef") ||
+		     equal(tok->next, "ifndef"))) {
+			tok = skip_cond_incl2(tok->next->next);
+			continue;
+		}
 
-    if (is_hash(tok) &&
-        (equal(tok->next, "elif") || equal(tok->next, "else") ||
-         equal(tok->next, "endif")))
-      break;
-    tok = tok->next;
-  }
-  return tok;
+		if (is_hash(tok) &&
+		    (equal(tok->next, "elif") || equal(tok->next, "else") ||
+		     equal(tok->next, "endif")))
+			break;
+		tok = tok->next;
+	}
+	return tok;
 }
 
-// Double-quote a given string and returns it.
-static char *quote_string(char *str) {
-  int bufsize = 3;
-  for (int i = 0; str[i]; i++) {
-    if (str[i] == '\\' || str[i] == '"')
-      bufsize++;
-    bufsize++;
-  }
+/**
+ * @brief Quotes a string by escaping special characters.
+ *
+ * This function takes an input string and returns a new string that is enclosed
+ * in double quotes (`"`). Any occurrences of backslashes (`\`) or double quotes
+ * within the string are escaped with a preceding backslash. The resulting string
+ * is dynamically allocated and should be freed after use.
+ *
+ * @param str The string to be quoted.
+ *
+ * @return A new string that is the quoted version of `str`.
+ */
+static char *quote_string(char *str)
+{
+	int bufsize = 3;
 
-  char *buf = calloc(1, bufsize);
-  char *p = buf;
-  *p++ = '"';
-  for (int i = 0; str[i]; i++) {
-    if (str[i] == '\\' || str[i] == '"')
-      *p++ = '\\';
-    *p++ = str[i];
-  }
-  *p++ = '"';
-  *p++ = '\0';
-  return buf;
+	for (int i = 0; str[i]; i++) {
+		if (str[i] == '\\' || str[i] == '"')
+			bufsize++;
+		bufsize++;
+	}
+
+	char *buf = calloc(1, bufsize);
+	char *p = buf;
+	*p++ = '"';
+	for (int i = 0; str[i]; i++) {
+		if (str[i] == '\\' || str[i] == '"')
+			*p++ = '\\';
+		*p++ = str[i];
+	}
+	*p++ = '"';
+	*p++ = '\0';
+	return buf;
 }
 
-static Token *new_str_token(char *str, Token *tmpl) {
-  char *buf = quote_string(str);
-  return tokenize(new_file(tmpl->file->name, tmpl->file->file_no, buf));
+/**
+ * @brief Creates a new token representing a string literal.
+ *
+ * This function creates a new token of type `TK_STR` that represents a string literal.
+ * The string is passed through the `quote_string` function to ensure it is properly
+ * quoted and escapes any special characters. The new token is created based on a
+ * template token `tmpl` and the string is tokenized as a new file.
+ *
+ * @param str The string to be used in the new token.
+ * @param tmpl The template token to base the new token on.
+ *
+ * @return A new token representing the quoted string literal.
+ */
+static Token *new_str_token(char *str, Token *tmpl)
+{
+	char *buf = quote_string(str);
+
+	return tokenize(new_file(tmpl->file->name, tmpl->file->file_no, buf));
 }
 
-// Copy all tokens until the next newline, terminate them with
-// an EOF token and then returns them. This function is used to
-// create a new list of tokens for `#if` arguments.
-static Token *copy_line(Token **rest, Token *tok) {
-  Token head = {};
-  Token *cur = &head;
+/**
+ * @brief Copies tokens from the current token list until the beginning of a new line.
+ *
+ * This function copies all tokens starting from the given token `tok` until it reaches
+ * the beginning of a new line. A new token list is created with these tokens and the
+ * resulting list ends with an EOF token. The remainder of the original token list,
+ * starting from the token after the new line, is returned through the `rest` pointer.
+ *
+ * @param rest A pointer to a `Token` pointer that will point to the remainder of the token list.
+ * @param tok The token from which to start copying.
+ *
+ * @return A new token list containing the copied tokens until the beginning of a new line.
+ */
+static Token *copy_line(Token **rest, Token *tok)
+{
+	Token head = {};
+	Token *cur = &head;
 
-  for (; !tok->at_bol; tok = tok->next)
-    cur = cur->next = copy_token(tok);
+	for (; !tok->at_bol; tok = tok->next)
+		cur = cur->next = copy_token(tok);
 
-  cur->next = new_eof(tok);
-  *rest = tok;
-  return head.next;
+	cur->next = new_eof(tok);
+	*rest = tok;
+	return head.next;
 }
 
-static Token *new_num_token(int val, Token *tmpl) {
-  char *buf = format("%d\n", val);
-  return tokenize(new_file(tmpl->file->name, tmpl->file->file_no, buf));
+/**
+ * @brief Creates a new token representing a numeric value.
+ *
+ * This function creates a new token of type `TK_NUM` representing the integer value `val`.
+ * The integer value is formatted as a string and then tokenized as part of a new file based
+ * on the provided template token `tmpl`. The resulting token is returned.
+ *
+ * @param val The integer value to represent as a token.
+ * @param tmpl The template token to base the new token on.
+ *
+ * @return A new token representing the integer value.
+ */
+static Token *new_num_token(int val, Token *tmpl)
+{
+	char *buf = format("%d\n", val);
+
+	return tokenize(new_file(tmpl->file->name, tmpl->file->file_no, buf));
 }
 
-static Token *read_const_expr(Token **rest, Token *tok) {
-  tok = copy_line(rest, tok);
+/**
+ * @brief Reads and processes a constant expression from the token list.
+ *
+ * This function processes tokens corresponding to a constant expression. It reads tokens
+ * until the end of the expression, checking for special constructs like `defined(foo)` and
+ * replacing them with `1` if the macro `foo` is defined, or `0` if not. The function
+ * returns the processed token list that represents the constant expression.
+ *
+ * @param rest A pointer to a `Token` pointer that will point to the remainder of the token list.
+ * @param tok The token list representing the expression to process.
+ *
+ * @return A new token list representing the processed constant expression.
+ */
+static Token *read_const_expr(Token **rest, Token *tok)
+{
+	tok = copy_line(rest, tok);
 
-  Token head = {};
-  Token *cur = &head;
+	Token head = {};
+	Token *cur = &head;
 
-  while (tok->kind != TK_EOF) {
-    // "defined(foo)" or "defined foo" becomes "1" if macro "foo"
-    // is defined. Otherwise "0".
-    if (equal(tok, "defined")) {
-      Token *start = tok;
-      bool has_paren = consume(&tok, tok->next, "(");
+	while (tok->kind != TK_EOF) {
+		// "defined(foo)" or "defined foo" becomes "1" if macro "foo"
+		// is defined. Otherwise "0".
+		if (equal(tok, "defined")) {
+			Token *start = tok;
+			bool has_paren = consume(&tok, tok->next, "(");
 
-      if (tok->kind != TK_IDENT)
-        error_tok(start, "macro name must be an identifier");
-      Macro *m = find_macro(tok);
-      tok = tok->next;
+			if (tok->kind != TK_IDENT)
+				error_tok(start, "macro name must be an identifier");
+			Macro *m = find_macro(tok);
+			tok = tok->next;
 
-      if (has_paren)
-        tok = skip(tok, ")");
+			if (has_paren)
+				tok = skip(tok, ")");
 
-      cur = cur->next = new_num_token(m ? 1 : 0, start);
-      continue;
-    }
+			cur = cur->next = new_num_token(m ? 1 : 0, start);
+			continue;
+		}
 
-    cur = cur->next = tok;
-    tok = tok->next;
-  }
+		cur = cur->next = tok;
+		tok = tok->next;
+	}
 
-  cur->next = tok;
-  return head.next;
+	cur->next = tok;
+	return head.next;
 }
 
-// Read and evaluate a constant expression.
-static long eval_const_expr(Token **rest, Token *tok) {
-  Token *start = tok;
-  Token *expr = read_const_expr(rest, tok->next);
-  expr = preprocess2(expr);
+/**
+ * @brief Evaluates a constant expression and returns its value.
+ *
+ * This function evaluates a constant expression by first reading and preprocessing the
+ * expression. It then replaces non-macro identifiers with `0` and evaluates the remaining
+ * expression to obtain a constant value. The result is returned as a `long` integer.
+ *
+ * @param rest A pointer to a `Token` pointer that will point to the remainder of the token list.
+ * @param tok The token list representing the constant expression to evaluate.
+ *
+ * @return The evaluated value of the constant expression.
+ *
+ * @throws Error if no expression is found or if extra tokens remain after evaluation.
+ */
+static long eval_const_expr(Token **rest, Token *tok)
+{
+	Token *start = tok;
+	Token *expr = read_const_expr(rest, tok->next);
 
-  if (expr->kind == TK_EOF)
-    error_tok(start, "no expression");
+	expr = preprocess2(expr);
 
-  // [https://www.sigbus.info/n1570#6.10.1p4] The standard requires
-  // we replace remaining non-macro identifiers with "0" before
-  // evaluating a constant expression. For example, `#if foo` is
-  // equivalent to `#if 0` if foo is not defined.
-  for (Token *t = expr; t->kind != TK_EOF; t = t->next) {
-    if (t->kind == TK_IDENT) {
-      Token *next = t->next;
-      *t = *new_num_token(0, t);
-      t->next = next;
-    }
-  }
+	if (expr->kind == TK_EOF)
+		error_tok(start, "no expression");
 
-  // Convert pp-numbers to regular numbers
-  convert_pp_tokens(expr);
+	// [https://www.sigbus.info/n1570#6.10.1p4] The standard requires
+	// we replace remaining non-macro identifiers with "0" before
+	// evaluating a constant expression. For example, `#if foo` is
+	// equivalent to `#if 0` if foo is not defined.
+	for (Token *t = expr; t->kind != TK_EOF; t = t->next) {
+		if (t->kind == TK_IDENT) {
+			Token *next = t->next;
+			*t = *new_num_token(0, t);
+			t->next = next;
+		}
+	}
 
-  Token *rest2;
-  long val = const_expr(&rest2, expr);
-  if (rest2->kind != TK_EOF)
-    error_tok(rest2, "extra token");
-  return val;
+	// Convert pp-numbers to regular numbers
+	convert_pp_tokens(expr);
+
+	Token *rest2;
+	long val = const_expr(&rest2, expr);
+	if (rest2->kind != TK_EOF)
+		error_tok(rest2, "extra token");
+	return val;
 }
 
-static CondIncl *push_cond_incl(Token *tok, bool included) {
-  CondIncl *ci = calloc(1, sizeof(CondIncl));
-  ci->next = cond_incl;
-  ci->ctx = IN_THEN;
-  ci->tok = tok;
-  ci->included = included;
-  cond_incl = ci;
-  return ci;
+/**
+ * @brief Pushes a new conditional inclusion context onto the stack.
+ *
+ * This function creates a new `CondIncl` structure representing the state of a conditional
+ * inclusion directive (e.g., `#if`, `#ifdef`, `#ifndef`, `#else`, `#elif`). It stores the
+ * current token and inclusion status (`included`) before pushing it onto the global stack.
+ *
+ * @param tok The token representing the current conditional inclusion directive.
+ * @param included A boolean indicating whether the conditional inclusion is active.
+ *
+ * @return A pointer to the newly created `CondIncl` structure.
+ */
+static CondIncl *push_cond_incl(Token *tok, bool included)
+{
+	CondIncl *ci = calloc(1, sizeof(CondIncl));
+
+	ci->next = cond_incl;
+	ci->ctx = IN_THEN;
+	ci->tok = tok;
+	ci->included = included;
+	cond_incl = ci;
+	return ci;
 }
 
-static Macro *find_macro(Token *tok) {
-  if (tok->kind != TK_IDENT)
-    return NULL;
-  return hashmap_get2(&macros, tok->loc, tok->len);
+/**
+ * @brief Finds a macro by its identifier token.
+ *
+ * This function searches the `macros` hashmap for a macro with the name corresponding to
+ * the provided identifier token. If the token is not an identifier or the macro is not found,
+ * it returns `NULL`.
+ *
+ * @param tok The token representing the macro name.
+ *
+ * @return A pointer to the `Macro` structure corresponding to the identifier token, or `NULL`
+ *         if not found.
+ */
+static Macro *find_macro(Token *tok)
+{
+	if (tok->kind != TK_IDENT)
+		return NULL;
+	return hashmap_get2(&macros, tok->loc, tok->len);
 }
 
-static Macro *add_macro(char *name, bool is_objlike, Token *body) {
-  Macro *m = calloc(1, sizeof(Macro));
-  m->name = name;
-  m->is_objlike = is_objlike;
-  m->body = body;
-  hashmap_put(&macros, name, m);
-  return m;
+/**
+ * @brief Adds a new macro to the macros hashmap.
+ *
+ * This function creates a new `Macro` structure representing a macro with the specified name,
+ * type (object-like or function-like), and body. The macro is added to the `macros` hashmap,
+ * and a pointer to the newly created `Macro` structure is returned.
+ *
+ * @param name The name of the macro.
+ * @param is_objlike A boolean indicating whether the macro is object-like (true) or function-like (false).
+ * @param body The body of the macro, represented as a token list.
+ *
+ * @return A pointer to the newly created `Macro` structure.
+ */
+static Macro *add_macro(char *name, bool is_objlike, Token *body)
+{
+	Macro *m = calloc(1, sizeof(Macro));
+
+	m->name = name;
+	m->is_objlike = is_objlike;
+	m->body = body;
+	hashmap_put(&macros, name, m);
+	return m;
 }
 
-static MacroParam *read_macro_params(Token **rest, Token *tok, char **va_args_name) {
-  MacroParam head = {};
-  MacroParam *cur = &head;
+/**
+ * @brief Reads macro parameters from a token list.
+ *
+ * This function parses the parameter list of a macro definition from the provided token list.
+ * It handles both named parameters and variadic parameters (`...`). If a variadic parameter is
+ * encountered, it sets the `va_args_name` to `__VA_ARGS__` or to the name of the variadic parameter.
+ *
+ * @param rest A pointer to a `Token` pointer that will point to the remainder of the token list
+ *             after parsing the parameters.
+ * @param tok The token list representing the macro parameters.
+ * @param va_args_name A pointer to a string that will hold the name of the variadic arguments (if any).
+ *
+ * @return A linked list of `MacroParam` structures representing the parsed macro parameters.
+ *
+ * @throws Error if a non-identifier token is encountered where an identifier is expected.
+ */
+static MacroParam *read_macro_params(Token **rest, Token *tok, char **va_args_name)
+{
+	MacroParam head = {};
+	MacroParam *cur = &head;
 
-  while (!equal(tok, ")")) {
-    if (cur != &head)
-      tok = skip(tok, ",");
+	while (!equal(tok, ")")) {
+		if (cur != &head)
+			tok = skip(tok, ",");
 
-    if (equal(tok, "...")) {
-      *va_args_name = "__VA_ARGS__";
-      *rest = skip(tok->next, ")");
-      return head.next;
-    }
+		if (equal(tok, "...")) {
+			*va_args_name = "__VA_ARGS__";
+			*rest = skip(tok->next, ")");
+			return head.next;
+		}
 
-    if (tok->kind != TK_IDENT)
-      error_tok(tok, "expected an identifier");
+		if (tok->kind != TK_IDENT)
+			error_tok(tok, "expected an identifier");
 
-    if (equal(tok->next, "...")) {
-      *va_args_name = strndup(tok->loc, tok->len);
-      *rest = skip(tok->next->next, ")");
-      return head.next;
-    }
+		if (equal(tok->next, "...")) {
+			*va_args_name = strndup(tok->loc, tok->len);
+			*rest = skip(tok->next->next, ")");
+			return head.next;
+		}
 
-    MacroParam *m = calloc(1, sizeof(MacroParam));
-    m->name = strndup(tok->loc, tok->len);
-    cur = cur->next = m;
-    tok = tok->next;
-  }
+		MacroParam *m = calloc(1, sizeof(MacroParam));
+		m->name = strndup(tok->loc, tok->len);
+		cur = cur->next = m;
+		tok = tok->next;
+	}
 
-  *rest = tok->next;
-  return head.next;
+	*rest = tok->next;
+	return head.next;
 }
 
-static void read_macro_definition(Token **rest, Token *tok) {
-  if (tok->kind != TK_IDENT)
-    error_tok(tok, "macro name must be an identifier");
-  char *name = strndup(tok->loc, tok->len);
-  tok = tok->next;
+/**
+ * @brief Reads a macro definition from a token list.
+ *
+ * This function parses a macro definition, which can be either an object-like macro or
+ * a function-like macro. If the macro is function-like, it reads the parameters and
+ * the body of the macro. If the macro is object-like, it simply adds the macro with the
+ * given name and body.
+ *
+ * @param rest A pointer to a `Token` pointer that will point to the remainder of the token list after parsing.
+ * @param tok The token list representing the macro definition.
+ *
+ * @throws Error if the macro name is not an identifier.
+ */
+static void read_macro_definition(Token **rest, Token *tok)
+{
+	if (tok->kind != TK_IDENT)
+		error_tok(tok, "macro name must be an identifier");
+	char *name = strndup(tok->loc, tok->len);
+	tok = tok->next;
 
-  if (!tok->has_space && equal(tok, "(")) {
-    // Function-like macro
-    char *va_args_name = NULL;
-    MacroParam *params = read_macro_params(&tok, tok->next, &va_args_name);
+	if (!tok->has_space && equal(tok, "(")) {
+		// Function-like macro
+		char *va_args_name = NULL;
+		MacroParam *params = read_macro_params(&tok, tok->next, &va_args_name);
 
-    Macro *m = add_macro(name, false, copy_line(rest, tok));
-    m->params = params;
-    m->va_args_name = va_args_name;
-  } else {
-    // Object-like macro
-    add_macro(name, true, copy_line(rest, tok));
-  }
+		Macro *m = add_macro(name, false, copy_line(rest, tok));
+		m->params = params;
+		m->va_args_name = va_args_name;
+	} else {
+		// Object-like macro
+		add_macro(name, true, copy_line(rest, tok));
+	}
 }
 
-static MacroArg *read_macro_arg_one(Token **rest, Token *tok, bool read_rest) {
-  Token head = {};
-  Token *cur = &head;
-  int level = 0;
+/**
+ * @brief Reads a single macro argument.
+ *
+ * This function reads a single argument in a macro invocation. It handles parentheses to
+ * correctly parse nested expressions within the argument. The argument is returned as
+ * a `MacroArg` structure, containing the parsed token list for the argument.
+ *
+ * @param rest A pointer to a `Token` pointer that will point to the remainder of the token list after parsing.
+ * @param tok The token list representing the macro argument.
+ * @param read_rest A boolean flag indicating whether to read the rest of the arguments.
+ *
+ * @return A pointer to the `MacroArg` structure representing the parsed argument.
+ *
+ * @throws Error if the input ends prematurely while reading the argument.
+ */
+static MacroArg *read_macro_arg_one(Token **rest, Token *tok, bool read_rest)
+{
+	Token head = {};
+	Token *cur = &head;
+	int level = 0;
 
-  for (;;) {
-    if (level == 0 && equal(tok, ")"))
-      break;
-    if (level == 0 && !read_rest && equal(tok, ","))
-      break;
+	for (;;) {
+		if (level == 0 && equal(tok, ")"))
+			break;
+		if (level == 0 && !read_rest && equal(tok, ","))
+			break;
 
-    if (tok->kind == TK_EOF)
-      error_tok(tok, "premature end of input");
+		if (tok->kind == TK_EOF)
+			error_tok(tok, "premature end of input");
 
-    if (equal(tok, "("))
-      level++;
-    else if (equal(tok, ")"))
-      level--;
+		if (equal(tok, "("))
+			level++;
+		else if (equal(tok, ")"))
+			level--;
 
-    cur = cur->next = copy_token(tok);
-    tok = tok->next;
-  }
+		cur = cur->next = copy_token(tok);
+		tok = tok->next;
+	}
 
-  cur->next = new_eof(tok);
+	cur->next = new_eof(tok);
 
-  MacroArg *arg = calloc(1, sizeof(MacroArg));
-  arg->tok = head.next;
-  *rest = tok;
-  return arg;
+	MacroArg *arg = calloc(1, sizeof(MacroArg));
+	arg->tok = head.next;
+	*rest = tok;
+	return arg;
 }
 
-static MacroArg *
-read_macro_args(Token **rest, Token *tok, MacroParam *params, char *va_args_name) {
-  Token *start = tok;
-  tok = tok->next->next;
+/**
+ * @brief Reads and parses macro arguments from a token list.
+ *
+ * This function reads and parses the arguments for a macro invocation, matching the
+ * parameters with the corresponding arguments. It handles the variadic argument case
+ * (e.g., `__VA_ARGS__`). The arguments are returned as a linked list of `MacroArg` structures.
+ *
+ * @param rest A pointer to a `Token` pointer that will point to the remainder of the token list after parsing.
+ * @param tok The token list representing the macro arguments.
+ * @param params A linked list of `MacroParam` structures representing the macro's parameters.
+ * @param va_args_name The name of the variadic argument, or `NULL` if no variadic argument exists.
+ *
+ * @return A linked list of `MacroArg` structures representing the parsed macro arguments.
+ *
+ * @throws Error if there are too many arguments or if a syntax error occurs during parsing.
+ */
+static MacroArg *read_macro_args(Token **rest, Token *tok, MacroParam *params, char *va_args_name)
+{
+	Token *start = tok;
 
-  MacroArg head = {};
-  MacroArg *cur = &head;
+	tok = tok->next->next;
 
-  MacroParam *pp = params;
-  for (; pp; pp = pp->next) {
-    if (cur != &head)
-      tok = skip(tok, ",");
-    cur = cur->next = read_macro_arg_one(&tok, tok, false);
-    cur->name = pp->name;
-  }
+	MacroArg head = {};
+	MacroArg *cur = &head;
 
-  if (va_args_name) {
-    MacroArg *arg;
-    if (equal(tok, ")")) {
-      arg = calloc(1, sizeof(MacroArg));
-      arg->tok = new_eof(tok);
-    } else {
-      if (pp != params)
-        tok = skip(tok, ",");
-      arg = read_macro_arg_one(&tok, tok, true);
-    }
-    arg->name = va_args_name;;
-    arg->is_va_args = true;
-    cur = cur->next = arg;
-  } else if (pp) {
-    error_tok(start, "too many arguments");
-  }
+	MacroParam *pp = params;
+	for (; pp; pp = pp->next) {
+		if (cur != &head)
+			tok = skip(tok, ",");
+		cur = cur->next = read_macro_arg_one(&tok, tok, false);
+		cur->name = pp->name;
+	}
 
-  skip(tok, ")");
-  *rest = tok;
-  return head.next;
+	if (va_args_name) {
+		MacroArg *arg;
+		if (equal(tok, ")")) {
+			arg = calloc(1, sizeof(MacroArg));
+			arg->tok = new_eof(tok);
+		} else {
+			if (pp != params)
+				tok = skip(tok, ",");
+			arg = read_macro_arg_one(&tok, tok, true);
+		}
+		arg->name = va_args_name;;
+		arg->is_va_args = true;
+		cur = cur->next = arg;
+	} else if (pp) {
+		error_tok(start, "too many arguments");
+	}
+
+	skip(tok, ")");
+	*rest = tok;
+	return head.next;
 }
 
-static MacroArg *find_arg(MacroArg *args, Token *tok) {
-  for (MacroArg *ap = args; ap; ap = ap->next)
-    if (tok->len == strlen(ap->name) && !strncmp(tok->loc, ap->name, tok->len))
-      return ap;
-  return NULL;
+/**
+ * @brief Finds a macro argument by its name.
+ *
+ * This function searches for a macro argument in the provided list of arguments.
+ * It compares the token name with the argument names, and returns the matching
+ * `MacroArg` if found.
+ *
+ * @param args A linked list of `MacroArg` structures representing the macro arguments.
+ * @param tok The token representing the argument name.
+ *
+ * @return A pointer to the `MacroArg` structure representing the matching argument, or `NULL` if not found.
+ */
+static MacroArg *find_arg(MacroArg *args, Token *tok)
+{
+	for (MacroArg *ap = args; ap; ap = ap->next)
+		if (tok->len == strlen(ap->name) && !strncmp(tok->loc, ap->name, tok->len))
+			return ap;
+	return NULL;
 }
 
-// Concatenates all tokens in `tok` and returns a new string.
-static char *join_tokens(Token *tok, Token *end) {
-  // Compute the length of the resulting token.
-  int len = 1;
-  for (Token *t = tok; t != end && t->kind != TK_EOF; t = t->next) {
-    if (t != tok && t->has_space)
-      len++;
-    len += t->len;
-  }
+/**
+ * @brief Concatenates all tokens in a token list into a single string.
+ *
+ * This function iterates over a list of tokens and concatenates their string values
+ * into a single string. It also includes spaces between tokens if necessary.
+ *
+ * @param tok The token list to concatenate.
+ * @param end The token that marks the end of the concatenation range.
+ *
+ * @return A new string containing the concatenated token values.
+ */
+static char *join_tokens(Token *tok, Token *end)
+{
+	// Compute the length of the resulting token.
+	int len = 1;
 
-  char *buf = calloc(1, len);
+	for (Token *t = tok; t != end && t->kind != TK_EOF; t = t->next) {
+		if (t != tok && t->has_space)
+			len++;
+		len += t->len;
+	}
 
-  // Copy token texts.
-  int pos = 0;
-  for (Token *t = tok; t != end && t->kind != TK_EOF; t = t->next) {
-    if (t != tok && t->has_space)
-      buf[pos++] = ' ';
-    strncpy(buf + pos, t->loc, t->len);
-    pos += t->len;
-  }
-  buf[pos] = '\0';
-  return buf;
+	char *buf = calloc(1, len);
+
+	// Copy token texts.
+	int pos = 0;
+	for (Token *t = tok; t != end && t->kind != TK_EOF; t = t->next) {
+		if (t != tok && t->has_space)
+			buf[pos++] = ' ';
+		strncpy(buf + pos, t->loc, t->len);
+		pos += t->len;
+	}
+	buf[pos] = '\0';
+	return buf;
 }
 
-// Concatenates all tokens in `arg` and returns a new string token.
-// This function is used for the stringizing operator (#).
-static Token *stringize(Token *hash, Token *arg) {
-  // Create a new string token. We need to set some value to its
-  // source location for error reporting function, so we use a macro
-  // name token as a template.
-  char *s = join_tokens(arg, NULL);
-  return new_str_token(s, hash);
+/**
+ * @brief Concatenates a list of tokens into a single string token using the stringizing operator (`#`).
+ *
+ * This function concatenates all tokens in the `arg` list and creates a new string
+ * token from the resulting string. This is typically used for the stringizing operator
+ * (`#`) in macros.
+ *
+ * @param hash The token representing the `#` operator.
+ * @param arg The list of tokens to concatenate.
+ *
+ * @return A new string token representing the concatenated tokens.
+ */
+static Token *stringize(Token *hash, Token *arg)
+{
+	// Create a new string token. We need to set some value to its
+	// source location for error reporting function, so we use a macro
+	// name token as a template.
+	char *s = join_tokens(arg, NULL);
+
+	return new_str_token(s, hash);
 }
 
-// Concatenate two tokens to create a new token.
-static Token *paste(Token *lhs, Token *rhs) {
-  // Paste the two tokens.
-  char *buf = format("%.*s%.*s", lhs->len, lhs->loc, rhs->len, rhs->loc);
+/**
+ * @brief Concatenates two tokens into a single new token.
+ *
+ * This function concatenates the two given tokens (`lhs` and `rhs`) into a new
+ * token. The resulting string is tokenized, and if the concatenated result is
+ * an invalid token, an error is raised.
+ *
+ * @param lhs The left token.
+ * @param rhs The right token.
+ *
+ * @return A new token resulting from the concatenation of the two tokens.
+ *
+ * @throws Error if the concatenation results in an invalid token.
+ */
+static Token *paste(Token *lhs, Token *rhs)
+{
+	// Paste the two tokens.
+	char *buf = format("%.*s%.*s", lhs->len, lhs->loc, rhs->len, rhs->loc);
 
-  // Tokenize the resulting string.
-  Token *tok = tokenize(new_file(lhs->file->name, lhs->file->file_no, buf));
-  if (tok->next->kind != TK_EOF)
-    error_tok(lhs, "pasting forms '%s', an invalid token", buf);
-  return tok;
+	// Tokenize the resulting string.
+	Token *tok = tokenize(new_file(lhs->file->name, lhs->file->file_no, buf));
+
+	if (tok->next->kind != TK_EOF)
+		error_tok(lhs, "pasting forms '%s', an invalid token", buf);
+	return tok;
 }
 
-static bool has_varargs(MacroArg *args) {
-  for (MacroArg *ap = args; ap; ap = ap->next)
-    if (!strcmp(ap->name, "__VA_ARGS__"))
-      return ap->tok->kind != TK_EOF;
-  return false;
+/**
+ * @brief Checks if a macro argument list contains variadic arguments (`__VA_ARGS__`).
+ *
+ * This function checks if the given list of macro arguments contains a variadic
+ * argument, represented by the special name `__VA_ARGS__`. It also verifies if the
+ * variadic argument has been properly defined (i.e., not an empty token).
+ *
+ * @param args A linked list of `MacroArg` structures representing the macro arguments.
+ *
+ * @return `true` if the argument list contains a valid variadic argument (`__VA_ARGS__`),
+ *         `false` otherwise.
+ */
+static bool has_varargs(MacroArg *args)
+{
+	for (MacroArg *ap = args; ap; ap = ap->next)
+		if (!strcmp(ap->name, "__VA_ARGS__"))
+			return ap->tok->kind != TK_EOF;
+	return false;
 }
 
-// Replace func-like macro parameters with given arguments.
-static Token *subst(Token *tok, MacroArg *args) {
-  Token head = {};
-  Token *cur = &head;
+/**
+ * @brief Substitutes macro parameters with the given arguments.
+ *
+ * This function performs the substitution of macro parameters with the corresponding
+ * macro arguments in the provided token list (`tok`). It handles the stringizing
+ * (`#`), pasting (`##`), and variadic argument (`__VA_ARGS__`) operations as part
+ * of the macro expansion process.
+ *
+ * @param tok A list of tokens to perform macro parameter substitution on.
+ * @param args A list of `MacroArg` structures representing the macro arguments.
+ *
+ * @return A new token list with the macro parameters substituted by the given arguments.
+ *
+ * @throws Error if there are issues during the macro parameter substitution, such as
+ *         invalid usage of `#`, `##`, or incorrect macro argument handling.
+ */
+static Token *subst(Token *tok, MacroArg *args)
+{
+	Token head = {};
+	Token *cur = &head;
 
-  while (tok->kind != TK_EOF) {
-    // "#" followed by a parameter is replaced with stringized actuals.
-    if (equal(tok, "#")) {
-      MacroArg *arg = find_arg(args, tok->next);
-      if (!arg)
-        error_tok(tok->next, "'#' is not followed by a macro parameter");
-      cur = cur->next = stringize(tok, arg->tok);
-      tok = tok->next->next;
-      continue;
-    }
+	while (tok->kind != TK_EOF) {
+		// "#" followed by a parameter is replaced with stringized actuals.
+		if (equal(tok, "#")) {
+			MacroArg *arg = find_arg(args, tok->next);
+			if (!arg)
+				error_tok(tok->next, "'#' is not followed by a macro parameter");
+			cur = cur->next = stringize(tok, arg->tok);
+			tok = tok->next->next;
+			continue;
+		}
 
-    // [GNU] If __VA_ARG__ is empty, `,##__VA_ARGS__` is expanded
-    // to the empty token list. Otherwise, its expaned to `,` and
-    // __VA_ARGS__.
-    if (equal(tok, ",") && equal(tok->next, "##")) {
-      MacroArg *arg = find_arg(args, tok->next->next);
-      if (arg && arg->is_va_args) {
-        if (arg->tok->kind == TK_EOF) {
-          tok = tok->next->next->next;
-        } else {
-          cur = cur->next = copy_token(tok);
-          tok = tok->next->next;
-        }
-        continue;
-      }
-    }
+		// [GNU] If __VA_ARG__ is empty, `,##__VA_ARGS__` is expanded
+		// to the empty token list. Otherwise, it's expanded to `,` and
+		// __VA_ARGS__.
+		if (equal(tok, ",") && equal(tok->next, "##")) {
+			MacroArg *arg = find_arg(args, tok->next->next);
+			if (arg && arg->is_va_args) {
+				if (arg->tok->kind == TK_EOF) {
+					tok = tok->next->next->next;
+				} else {
+					cur = cur->next = copy_token(tok);
+					tok = tok->next->next;
+				}
+				continue;
+			}
+		}
 
-    if (equal(tok, "##")) {
-      if (cur == &head)
-        error_tok(tok, "'##' cannot appear at start of macro expansion");
+		// Handle the pasting operator (##) which concatenates two tokens.
+		if (equal(tok, "##")) {
+			if (cur == &head)
+				error_tok(tok, "'##' cannot appear at start of macro expansion");
 
-      if (tok->next->kind == TK_EOF)
-        error_tok(tok, "'##' cannot appear at end of macro expansion");
+			if (tok->next->kind == TK_EOF)
+				error_tok(tok, "'##' cannot appear at end of macro expansion");
 
-      MacroArg *arg = find_arg(args, tok->next);
-      if (arg) {
-        if (arg->tok->kind != TK_EOF) {
-          *cur = *paste(cur, arg->tok);
-          for (Token *t = arg->tok->next; t->kind != TK_EOF; t = t->next)
-            cur = cur->next = copy_token(t);
-        }
-        tok = tok->next->next;
-        continue;
-      }
+			MacroArg *arg = find_arg(args, tok->next);
+			if (arg) {
+				if (arg->tok->kind != TK_EOF) {
+					*cur = *paste(cur, arg->tok);
+					for (Token *t = arg->tok->next; t->kind != TK_EOF; t = t->next)
+						cur = cur->next = copy_token(t);
+				}
+				tok = tok->next->next;
+				continue;
+			}
 
-      *cur = *paste(cur, tok->next);
-      tok = tok->next->next;
-      continue;
-    }
+			*cur = *paste(cur, tok->next);
+			tok = tok->next->next;
+			continue;
+		}
 
-    MacroArg *arg = find_arg(args, tok);
+		// Look for macro arguments and handle them.
+		MacroArg *arg = find_arg(args, tok);
 
-    if (arg && equal(tok->next, "##")) {
-      Token *rhs = tok->next->next;
+		if (arg && equal(tok->next, "##")) {
+			Token *rhs = tok->next->next;
 
-      if (arg->tok->kind == TK_EOF) {
-        MacroArg *arg2 = find_arg(args, rhs);
-        if (arg2) {
-          for (Token *t = arg2->tok; t->kind != TK_EOF; t = t->next)
-            cur = cur->next = copy_token(t);
-        } else {
-          cur = cur->next = copy_token(rhs);
-        }
-        tok = rhs->next;
-        continue;
-      }
+			if (arg->tok->kind == TK_EOF) {
+				MacroArg *arg2 = find_arg(args, rhs);
+				if (arg2)
+					for (Token *t = arg2->tok; t->kind != TK_EOF; t = t->next)
+						cur = cur->next = copy_token(t);
+				else
+					cur = cur->next = copy_token(rhs);
+				tok = rhs->next;
+				continue;
+			}
 
-      for (Token *t = arg->tok; t->kind != TK_EOF; t = t->next)
-        cur = cur->next = copy_token(t);
-      tok = tok->next;
-      continue;
-    }
+			for (Token *t = arg->tok; t->kind != TK_EOF; t = t->next)
+				cur = cur->next = copy_token(t);
+			tok = tok->next;
+			continue;
+		}
 
-    // If __VA_ARG__ is empty, __VA_OPT__(x) is expanded to the
-    // empty token list. Otherwise, __VA_OPT__(x) is expanded to x.
-    if (equal(tok, "__VA_OPT__") && equal(tok->next, "(")) {
-      MacroArg *arg = read_macro_arg_one(&tok, tok->next->next, true);
-      if (has_varargs(args))
-        for (Token *t = arg->tok; t->kind != TK_EOF; t = t->next)
-          cur = cur->next = t;
-      tok = skip(tok, ")");
-      continue;
-    }
+		// Handle __VA_OPT__ (optional variadic argument) expansion.
+		if (equal(tok, "__VA_OPT__") && equal(tok->next, "(")) {
+			MacroArg *arg = read_macro_arg_one(&tok, tok->next->next, true);
+			if (has_varargs(args))
+				for (Token *t = arg->tok; t->kind != TK_EOF; t = t->next)
+					cur = cur->next = t;
+			tok = skip(tok, ")");
+			continue;
+		}
 
-    // Handle a macro token. Macro arguments are completely macro-expanded
-    // before they are substituted into a macro body.
-    if (arg) {
-      Token *t = preprocess2(arg->tok);
-      t->at_bol = tok->at_bol;
-      t->has_space = tok->has_space;
-      for (; t->kind != TK_EOF; t = t->next)
-        cur = cur->next = copy_token(t);
-      tok = tok->next;
-      continue;
-    }
+		// If the token is part of a macro argument, expand it fully before substitution.
+		if (arg) {
+			Token *t = preprocess2(arg->tok);
+			t->at_bol = tok->at_bol;
+			t->has_space = tok->has_space;
+			for (; t->kind != TK_EOF; t = t->next)
+				cur = cur->next = copy_token(t);
+			tok = tok->next;
+			continue;
+		}
 
-    // Handle a non-macro token.
-    cur = cur->next = copy_token(tok);
-    tok = tok->next;
-    continue;
-  }
+		// Handle a non-macro token (just copy it).
+		cur = cur->next = copy_token(tok);
+		tok = tok->next;
+		continue;
+	}
 
-  cur->next = tok;
-  return head.next;
+	cur->next = tok;
+	return head.next;
 }
 
-// If tok is a macro, expand it and return true.
-// Otherwise, do nothing and return false.
-static bool expand_macro(Token **rest, Token *tok) {
-  if (hideset_contains(tok->hideset, tok->loc, tok->len))
-    return false;
+/**
+ * @brief Expands a macro if it is found and returns true.
+ *
+ * This function checks if the given token (`tok`) corresponds to a defined macro.
+ * If it does, the macro is expanded and the resulting tokens are returned in
+ * the `rest` pointer. If the token is not a macro, the function does nothing
+ * and returns false.
+ *
+ * The function handles both object-like and function-like macros, including
+ * special handling for built-in dynamic macros (such as `__LINE__`).
+ *
+ * @param rest A pointer to the token list that will receive the expanded macro tokens.
+ * @param tok The token that is being checked for macro expansion.
+ *
+ * @return True if the token is a macro and was expanded, false otherwise.
+ */
+static bool expand_macro(Token **rest, Token *tok)
+{
+	// Check if the token is hidden in the current hideset.
+	if (hideset_contains(tok->hideset, tok->loc, tok->len))
+		return false;
 
-  Macro *m = find_macro(tok);
-  if (!m)
-    return false;
+	// Look up the macro associated with the token.
+	Macro *m = find_macro(tok);
+	if (!m)
+		return false;
 
-  // Built-in dynamic macro application such as __LINE__
-  if (m->handler) {
-    *rest = m->handler(tok);
-    (*rest)->next = tok->next;
-    return true;
-  }
+	// Handle built-in dynamic macros like `__LINE__`.
+	if (m->handler) {
+		*rest = m->handler(tok);
+		(*rest)->next = tok->next;
+		return true;
+	}
 
-  // Object-like macro application
-  if (m->is_objlike) {
-    Hideset *hs = hideset_union(tok->hideset, new_hideset(m->name));
-    Token *body = add_hideset(m->body, hs);
-    for (Token *t = body; t->kind != TK_EOF; t = t->next)
-      t->origin = tok;
-    *rest = append(body, tok->next);
-    (*rest)->at_bol = tok->at_bol;
-    (*rest)->has_space = tok->has_space;
-    return true;
-  }
+	// Handle object-like macro expansion.
+	if (m->is_objlike) {
+		Hideset *hs = hideset_union(tok->hideset, new_hideset(m->name));
+		Token *body = add_hideset(m->body, hs);
+		for (Token *t = body; t->kind != TK_EOF; t = t->next)
+			t->origin = tok;
+		*rest = append(body, tok->next);
+		(*rest)->at_bol = tok->at_bol;
+		(*rest)->has_space = tok->has_space;
+		return true;
+	}
 
-  // If a funclike macro token is not followed by an argument list,
-  // treat it as a normal identifier.
-  if (!equal(tok->next, "("))
-    return false;
+	// If the macro is function-like but not followed by an argument list, return false.
+	if (!equal(tok->next, "("))
+		return false;
 
-  // Function-like macro application
-  Token *macro_token = tok;
-  MacroArg *args = read_macro_args(&tok, tok, m->params, m->va_args_name);
-  Token *rparen = tok;
+	// Handle function-like macro expansion.
+	Token *macro_token = tok;
+	MacroArg *args = read_macro_args(&tok, tok, m->params, m->va_args_name);
+	Token *rparen = tok;
 
-  // Tokens that consist a func-like macro invocation may have different
-  // hidesets, and if that's the case, it's not clear what the hideset
-  // for the new tokens should be. We take the interesection of the
-  // macro token and the closing parenthesis and use it as a new hideset
-  // as explained in the Dave Prossor's algorithm.
-  Hideset *hs = hideset_intersection(macro_token->hideset, rparen->hideset);
-  hs = hideset_union(hs, new_hideset(m->name));
+	// Handle the hideset intersection logic for function-like macros.
+	Hideset *hs = hideset_intersection(macro_token->hideset, rparen->hideset);
+	hs = hideset_union(hs, new_hideset(m->name));
 
-  Token *body = subst(m->body, args);
-  body = add_hideset(body, hs);
-  for (Token *t = body; t->kind != TK_EOF; t = t->next)
-    t->origin = macro_token;
-  *rest = append(body, tok->next);
-  (*rest)->at_bol = macro_token->at_bol;
-  (*rest)->has_space = macro_token->has_space;
-  return true;
+	// Perform the substitution of the macro body with the provided arguments.
+	Token *body = subst(m->body, args);
+	body = add_hideset(body, hs);
+	for (Token *t = body; t->kind != TK_EOF; t = t->next)
+		t->origin = macro_token;
+	*rest = append(body, tok->next);
+	(*rest)->at_bol = macro_token->at_bol;
+	(*rest)->has_space = macro_token->has_space;
+	return true;
 }
 
-char *search_include_paths(char *filename) {
-  if (filename[0] == '/')
-    return filename;
+/**
+ * @brief Searches for the path of an included file.
+ *
+ * This function searches for a file by its filename in the include paths.
+ * If the file is found, its full path is returned. If the filename is
+ * an absolute path (starts with `/`), it is returned as-is. The function
+ * also caches the paths of found files for faster future lookups.
+ *
+ * @param filename The name of the file to search for in the include paths.
+ *
+ * @return The full path of the file if found, or NULL if not found.
+ */
+char *search_include_paths(char *filename)
+{
+	// If the filename is an absolute path, return it directly.
+	if (filename[0] == '/')
+		return filename;
 
-  static HashMap cache;
-  char *cached = hashmap_get(&cache, filename);
-  if (cached)
-    return cached;
+	// Check if the file's path is already cached.
+	static HashMap cache;
+	char *cached = hashmap_get(&cache, filename);
+	if (cached)
+		return cached;
 
-  // Search a file from the include paths.
-  for (int i = 0; i < include_paths.len; i++) {
-    char *path = format("%s/%s", include_paths.data[i], filename);
-    if (!file_exists(path))
-      continue;
-    hashmap_put(&cache, filename, path);
-    include_next_idx = i + 1;
-    return path;
-  }
-  return NULL;
+	// Search through each include path for the file.
+	for (int i = 0; i < include_paths.len; i++) {
+		char *path = format("%s/%s", include_paths.data[i], filename);
+		if (!file_exists(path))
+			continue;
+		hashmap_put(&cache, filename, path);
+		include_next_idx = i + 1;
+		return path;
+	}
+	return NULL;
 }
 
-static char *search_include_next(char *filename) {
-  for (; include_next_idx < include_paths.len; include_next_idx++) {
-    char *path = format("%s/%s", include_paths.data[include_next_idx], filename);
-    if (file_exists(path))
-      return path;
-  }
-  return NULL;
+/**
+ * @brief Searches for the path of an included file starting from the current index.
+ *
+ * This function searches for a file in the include paths, starting from the
+ * current index (`include_next_idx`). If the file is found, its full path is
+ * returned. The function continues searching the include paths sequentially.
+ *
+ * @param filename The name of the file to search for in the include paths.
+ *
+ * @return The full path of the file if found, or NULL if not found.
+ */
+static char *search_include_next(char *filename)
+{
+	for (; include_next_idx < include_paths.len; include_next_idx++) {
+		char *path = format("%s/%s", include_paths.data[include_next_idx], filename);
+		if (file_exists(path))
+			return path;
+	}
+	return NULL;
 }
 
-// Read an #include argument.
-static char *read_include_filename(Token **rest, Token *tok, bool *is_dquote) {
-  // Pattern 1: #include "foo.h"
-  if (tok->kind == TK_STR) {
-    // A double-quoted filename for #include is a special kind of
-    // token, and we don't want to interpret any escape sequences in it.
-    // For example, "\f" in "C:\foo" is not a formfeed character but
-    // just two non-control characters, backslash and f.
-    // So we don't want to use token->str.
-    *is_dquote = true;
-    *rest = skip_line(tok->next);
-    return strndup(tok->loc + 1, tok->len - 2);
-  }
+/**
+ * @brief Reads the filename from an #include directive.
+ *
+ * This function parses the token list to extract the filename from an `#include`
+ * directive. The filename can appear in different formats:
+ * - Double-quoted string: `#include "foo.h"`
+ * - Angle-bracketed form: `#include <foo.h>`
+ * - Or as a macro (which is then expanded).
+ *
+ * @param rest A pointer to the token list, which will be advanced past the `#include` directive.
+ * @param tok The token corresponding to the `#include` directive.
+ * @param is_dquote A flag that indicates whether the filename is enclosed in double quotes.
+ *
+ * @return The filename as a string.
+ */
+static char *read_include_filename(Token **rest, Token *tok, bool *is_dquote)
+{
+	// Pattern 1: #include "foo.h"
+	if (tok->kind == TK_STR) {
+		*is_dquote = true;
+		*rest = skip_line(tok->next);
+		return strndup(tok->loc + 1, tok->len - 2);
+	}
 
-  // Pattern 2: #include <foo.h>
-  if (equal(tok, "<")) {
-    // Reconstruct a filename from a sequence of tokens between
-    // "<" and ">".
-    Token *start = tok;
+	// Pattern 2: #include <foo.h>
+	if (equal(tok, "<")) {
+		Token *start = tok;
 
-    // Find closing ">".
-    for (; !equal(tok, ">"); tok = tok->next)
-      if (tok->at_bol || tok->kind == TK_EOF)
-        error_tok(tok, "expected '>'");
+		// Find closing ">".
+		for (; !equal(tok, ">"); tok = tok->next)
+			if (tok->at_bol || tok->kind == TK_EOF)
+				error_tok(tok, "expected '>'");
 
-    *is_dquote = false;
-    *rest = skip_line(tok->next);
-    return join_tokens(start->next, tok);
-  }
+		*is_dquote = false;
+		*rest = skip_line(tok->next);
+		return join_tokens(start->next, tok);
+	}
 
-  // Pattern 3: #include FOO
-  // In this case FOO must be macro-expanded to either
-  // a single string token or a sequence of "<" ... ">".
-  if (tok->kind == TK_IDENT) {
-    Token *tok2 = preprocess2(copy_line(rest, tok));
-    return read_include_filename(&tok2, tok2, is_dquote);
-  }
+	// Pattern 3: #include FOO
+	if (tok->kind == TK_IDENT) {
+		Token *tok2 = preprocess2(copy_line(rest, tok));
+		return read_include_filename(&tok2, tok2, is_dquote);
+	}
 
-  error_tok(tok, "expected a filename");
+	error_tok(tok, "expected a filename");
 }
 
-// Detect the following "include guard" pattern.
-//
-//   #ifndef FOO_H
-//   #define FOO_H
-//   ...
-//   #endif
-static char *detect_include_guard(Token *tok) {
-  // Detect the first two lines.
-  if (!is_hash(tok) || !equal(tok->next, "ifndef"))
-    return NULL;
-  tok = tok->next->next;
+/**
+ * @brief Detects an include guard pattern in a token stream.
+ *
+ * This function checks if a given token stream matches the common pattern for
+ * an include guard:
+ *
+ * ```c
+ *   #ifndef FOO_H
+ *   #define FOO_H
+ *   ...
+ *   #endif
+ * ```
+ * The function returns the macro name used as the include guard if a valid
+ * include guard is detected.
+ *
+ * @param tok The token stream to examine.
+ *
+ * @return The macro name used for the include guard if found, or NULL if not.
+ */
+static char *detect_include_guard(Token *tok)
+{
+	// Check for the first two lines: #ifndef FOO_H and #define FOO_H
+	if (!is_hash(tok) || !equal(tok->next, "ifndef"))
+		return NULL;
+	tok = tok->next->next;
 
-  if (tok->kind != TK_IDENT)
-    return NULL;
+	if (tok->kind != TK_IDENT)
+		return NULL;
 
-  char *macro = strndup(tok->loc, tok->len);
-  tok = tok->next;
+	char *macro = strndup(tok->loc, tok->len);
+	tok = tok->next;
 
-  if (!is_hash(tok) || !equal(tok->next, "define") || !equal(tok->next->next, macro))
-    return NULL;
+	if (!is_hash(tok) || !equal(tok->next, "define") || !equal(tok->next->next, macro))
+		return NULL;
 
-  // Read until the end of the file.
-  while (tok->kind != TK_EOF) {
-    if (!is_hash(tok)) {
-      tok = tok->next;
-      continue;
-    }
+	// Check for the #endif at the end.
+	while (tok->kind != TK_EOF) {
+		if (!is_hash(tok)) {
+			tok = tok->next;
+			continue;
+		}
 
-    if (equal(tok->next, "endif") && tok->next->next->kind == TK_EOF)
-      return macro;
+		if (equal(tok->next, "endif") && tok->next->next->kind == TK_EOF)
+			return macro;
 
-    if (equal(tok, "if") || equal(tok, "ifdef") || equal(tok, "ifndef"))
-      tok = skip_cond_incl(tok->next);
-    else
-      tok = tok->next;
-  }
-  return NULL;
+		if (equal(tok, "if") || equal(tok, "ifdef") || equal(tok, "ifndef"))
+			tok = skip_cond_incl(tok->next);
+		else
+			tok = tok->next;
+	}
+	return NULL;
 }
 
-static Token *include_file(Token *tok, char *path, Token *filename_tok) {
-  // Check for "#pragma once"
-  if (hashmap_get(&pragma_once, path))
-    return tok;
+/**
+ * @brief Includes a file and returns the token stream after inclusion.
+ *
+ * This function processes the inclusion of a file and appends its token stream
+ * to the current one. It also checks for the `#pragma once` directive to avoid
+ * including the same file multiple times. Additionally, it looks for an include
+ * guard in the file to skip including it if necessary.
+ *
+ * @param tok The current token stream to which the included file's tokens will be appended.
+ * @param path The path of the file to include.
+ * @param filename_tok The token corresponding to the filename in the `#include` directive.
+ *
+ * @return The updated token stream after the file has been included.
+ */
+static Token *include_file(Token *tok, char *path, Token *filename_tok)
+{
+	// Check for "#pragma once"
+	if (hashmap_get(&pragma_once, path))
+		return tok;
 
-  // If we read the same file before, and if the file was guarded
-  // by the usual #ifndef ... #endif pattern, we may be able to
-  // skip the file without opening it.
-  static HashMap include_guards;
-  char *guard_name = hashmap_get(&include_guards, path);
-  if (guard_name && hashmap_get(&macros, guard_name))
-    return tok;
+	// If we read the same file before, and if the file was guarded
+	// by the usual #ifndef ... #endif pattern, we may be able to
+	// skip the file without opening it.
+	static HashMap include_guards;
+	char *guard_name = hashmap_get(&include_guards, path);
+	if (guard_name && hashmap_get(&macros, guard_name))
+		return tok;
 
-  Token *tok2 = tokenize_file(path);
-  if (!tok2)
-    error_tok(filename_tok, "%s: cannot open file: %s", path, strerror(errno));
+	Token *tok2 = tokenize_file(path);
+	if (!tok2)
+		error_tok(filename_tok, "%s: cannot open file: %s", path, strerror(errno));
 
-  guard_name = detect_include_guard(tok2);
-  if (guard_name)
-    hashmap_put(&include_guards, path, guard_name);
+	guard_name = detect_include_guard(tok2);
+	if (guard_name)
+		hashmap_put(&include_guards, path, guard_name);
 
-  return append(tok2, tok);
+	return append(tok2, tok);
 }
 
-// Read #line arguments
-static void read_line_marker(Token **rest, Token *tok) {
-  Token *start = tok;
-  tok = preprocess(copy_line(rest, tok));
+/**
+ * @brief Reads the arguments of a `#line` directive and updates the line number and filename.
+ *
+ * This function reads the arguments of a `#line` directive, which specifies a new
+ * line number and filename for the source code. The line number is updated by
+ * adjusting the `line_delta` and the file's display name is set accordingly.
+ *
+ * @param rest A pointer to the token list, which will be advanced past the `#line` directive.
+ * @param tok The token corresponding to the `#line` directive.
+ */
+static void read_line_marker(Token **rest, Token *tok)
+{
+	Token *start = tok;
 
-  if (tok->kind != TK_NUM || tok->ty->kind != TY_INT)
-    error_tok(tok, "invalid line marker");
-  start->file->line_delta = tok->val - start->line_no;
+	tok = preprocess(copy_line(rest, tok));
 
-  tok = tok->next;
-  if (tok->kind == TK_EOF)
-    return;
+	if (tok->kind != TK_NUM || tok->ty->kind != TY_INT)
+		error_tok(tok, "invalid line marker");
+	start->file->line_delta = tok->val - start->line_no;
 
-  if (tok->kind != TK_STR)
-    error_tok(tok, "filename expected");
-  start->file->display_name = tok->str;
+	tok = tok->next;
+	if (tok->kind == TK_EOF)
+		return;
+
+	if (tok->kind != TK_STR)
+		error_tok(tok, "filename expected");
+	start->file->display_name = tok->str;
 }
 
-// Visit all tokens in `tok` while evaluating preprocessing
-// macros and directives.
-static Token *preprocess2(Token *tok) {
-  Token head = {};
-  Token *cur = &head;
+/**
+ * @brief Preprocesses a list of tokens, evaluating preprocessor directives and expanding macros.
+ *
+ * This function iterates through a token stream, evaluating preprocessor directives
+ * such as `#include`, `#define`, `#ifdef`, etc., and expanding macros as needed.
+ * It handles conditional inclusion, line markers, and other preprocessor logic.
+ *
+ * @param tok The token stream to be preprocessed.
+ *
+ * @return The preprocessed token stream.
+ */
+static Token *preprocess2(Token *tok)
+{
+	Token head = {};
+	Token *cur = &head;
 
-  while (tok->kind != TK_EOF) {
-    // If it is a macro, expand it.
-    if (expand_macro(&tok, tok))
-      continue;
+	while (tok->kind != TK_EOF) {
+		// If it is a macro, expand it.
+		if (expand_macro(&tok, tok))
+			continue;
 
-    // Pass through if it is not a "#".
-    if (!is_hash(tok)) {
-      tok->line_delta = tok->file->line_delta;
-      tok->filename = tok->file->display_name;
-      cur = cur->next = tok;
-      tok = tok->next;
-      continue;
-    }
+		// Pass through if it is not a "#".
+		if (!is_hash(tok)) {
+			tok->line_delta = tok->file->line_delta;
+			tok->filename = tok->file->display_name;
+			cur = cur->next = tok;
+			tok = tok->next;
+			continue;
+		}
 
-    Token *start = tok;
-    tok = tok->next;
+		Token *start = tok;
+		tok = tok->next;
 
-    if (equal(tok, "include")) {
-      bool is_dquote;
-      char *filename = read_include_filename(&tok, tok->next, &is_dquote);
+		// Handle different preprocessor directives.
+		if (equal(tok, "include")) {
+			bool is_dquote;
+			char *filename = read_include_filename(&tok, tok->next, &is_dquote);
 
-      if (filename[0] != '/' && is_dquote) {
-        char *path = format("%s/%s", dirname(strdup(start->file->name)), filename);
-        if (file_exists(path)) {
-          tok = include_file(tok, path, start->next->next);
-          continue;
-        }
-      }
+			if (filename[0] != '/' && is_dquote) {
+				char *path = format("%s/%s", dirname(strdup(start->file->name)), filename);
+				if (file_exists(path)) {
+					tok = include_file(tok, path, start->next->next);
+					continue;
+				}
+			}
 
-      char *path = search_include_paths(filename);
-      tok = include_file(tok, path ? path : filename, start->next->next);
-      continue;
-    }
+			char *path = search_include_paths(filename);
+			tok = include_file(tok, path ? path : filename, start->next->next);
+			continue;
+		}
 
-    if (equal(tok, "include_next")) {
-      bool ignore;
-      char *filename = read_include_filename(&tok, tok->next, &ignore);
-      char *path = search_include_next(filename);
-      tok = include_file(tok, path ? path : filename, start->next->next);
-      continue;
-    }
+		if (equal(tok, "include_next")) {
+			bool ignore;
+			char *filename = read_include_filename(&tok, tok->next, &ignore);
+			char *path = search_include_next(filename);
+			tok = include_file(tok, path ? path : filename, start->next->next);
+			continue;
+		}
 
-    if (equal(tok, "define")) {
-      read_macro_definition(&tok, tok->next);
-      continue;
-    }
+		if (equal(tok, "define")) {
+			read_macro_definition(&tok, tok->next);
+			continue;
+		}
 
-    if (equal(tok, "undef")) {
-      tok = tok->next;
-      if (tok->kind != TK_IDENT)
-        error_tok(tok, "macro name must be an identifier");
-      undef_macro(strndup(tok->loc, tok->len));
-      tok = skip_line(tok->next);
-      continue;
-    }
+		if (equal(tok, "undef")) {
+			tok = tok->next;
+			if (tok->kind != TK_IDENT)
+				error_tok(tok, "macro name must be an identifier");
+			undef_macro(strndup(tok->loc, tok->len));
+			tok = skip_line(tok->next);
+			continue;
+		}
 
-    if (equal(tok, "if")) {
-      long val = eval_const_expr(&tok, tok);
-      push_cond_incl(start, val);
-      if (!val)
-        tok = skip_cond_incl(tok);
-      continue;
-    }
+		if (equal(tok, "if")) {
+			long val = eval_const_expr(&tok, tok);
+			push_cond_incl(start, val);
+			if (!val)
+				tok = skip_cond_incl(tok);
+			continue;
+		}
 
-    if (equal(tok, "ifdef")) {
-      bool defined = find_macro(tok->next);
-      push_cond_incl(tok, defined);
-      tok = skip_line(tok->next->next);
-      if (!defined)
-        tok = skip_cond_incl(tok);
-      continue;
-    }
+		if (equal(tok, "ifdef")) {
+			bool defined = find_macro(tok->next);
+			push_cond_incl(tok, defined);
+			tok = skip_line(tok->next->next);
+			if (!defined)
+				tok = skip_cond_incl(tok);
+			continue;
+		}
 
-    if (equal(tok, "ifndef")) {
-      bool defined = find_macro(tok->next);
-      push_cond_incl(tok, !defined);
-      tok = skip_line(tok->next->next);
-      if (defined)
-        tok = skip_cond_incl(tok);
-      continue;
-    }
+		if (equal(tok, "ifndef")) {
+			bool defined = find_macro(tok->next);
+			push_cond_incl(tok, !defined);
+			tok = skip_line(tok->next->next);
+			if (defined)
+				tok = skip_cond_incl(tok);
+			continue;
+		}
 
-    if (equal(tok, "elif")) {
-      if (!cond_incl || cond_incl->ctx == IN_ELSE)
-        error_tok(start, "stray #elif");
-      cond_incl->ctx = IN_ELIF;
+		if (equal(tok, "elif")) {
+			if (!cond_incl || cond_incl->ctx == IN_ELSE)
+				error_tok(start, "stray #elif");
+			cond_incl->ctx = IN_ELIF;
 
-      if (!cond_incl->included && eval_const_expr(&tok, tok))
-        cond_incl->included = true;
-      else
-        tok = skip_cond_incl(tok);
-      continue;
-    }
+			if (!cond_incl->included && eval_const_expr(&tok, tok))
+				cond_incl->included = true;
+			else
+				tok = skip_cond_incl(tok);
+			continue;
+		}
 
-    if (equal(tok, "else")) {
-      if (!cond_incl || cond_incl->ctx == IN_ELSE)
-        error_tok(start, "stray #else");
-      cond_incl->ctx = IN_ELSE;
-      tok = skip_line(tok->next);
+		if (equal(tok, "else")) {
+			if (!cond_incl || cond_incl->ctx == IN_ELSE)
+				error_tok(start, "stray #else");
+			cond_incl->ctx = IN_ELSE;
+			tok = skip_line(tok->next);
 
-      if (cond_incl->included)
-        tok = skip_cond_incl(tok);
-      continue;
-    }
+			if (cond_incl->included)
+				tok = skip_cond_incl(tok);
+			continue;
+		}
 
-    if (equal(tok, "endif")) {
-      if (!cond_incl)
-        error_tok(start, "stray #endif");
-      cond_incl = cond_incl->next;
-      tok = skip_line(tok->next);
-      continue;
-    }
+		if (equal(tok, "endif")) {
+			if (!cond_incl)
+				error_tok(start, "stray #endif");
+			cond_incl = cond_incl->next;
+			tok = skip_line(tok->next);
+			continue;
+		}
 
-    if (equal(tok, "line")) {
-      read_line_marker(&tok, tok->next);
-      continue;
-    }
+		if (equal(tok, "line")) {
+			read_line_marker(&tok, tok->next);
+			continue;
+		}
 
-    if (tok->kind == TK_PP_NUM) {
-      read_line_marker(&tok, tok);
-      continue;
-    }
+		if (tok->kind == TK_PP_NUM) {
+			read_line_marker(&tok, tok);
+			continue;
+		}
 
-    if (equal(tok, "pragma") && equal(tok->next, "once")) {
-      hashmap_put(&pragma_once, tok->file->name, (void *)1);
-      tok = skip_line(tok->next->next);
-      continue;
-    }
+		if (equal(tok, "pragma") && equal(tok->next, "once")) {
+			hashmap_put(&pragma_once, tok->file->name, (void *)1);
+			tok = skip_line(tok->next->next);
+			continue;
+		}
 
-    if (equal(tok, "pragma")) {
-      do {
-        tok = tok->next;
-      } while (!tok->at_bol);
-      continue;
-    }
+		if (equal(tok, "pragma")) {
+			do
+				tok = tok->next;
+			while (!tok->at_bol);
+			continue;
+		}
 
-    if (equal(tok, "error"))
-      error_tok(tok, "error");
+		if (equal(tok, "error"))
+			error_tok(tok, "error");
 
-    // `#`-only line is legal. It's called a null directive.
-    if (tok->at_bol)
-      continue;
+		// `#`-only line is legal. It's called a null directive.
+		if (tok->at_bol)
+			continue;
 
-    error_tok(tok, "invalid preprocessor directive");
-  }
+		error_tok(tok, "invalid preprocessor directive");
+	}
 
-  cur->next = tok;
-  return head.next;
+	cur->next = tok;
+	return head.next;
 }
 
-void define_macro(char *name, char *buf) {
-  Token *tok = tokenize(new_file("<built-in>", 1, buf));
-  add_macro(name, true, tok);
+/**
+ * @brief Defines a macro with the given name and definition.
+ *
+ * This function defines a new macro by tokenizing the provided macro
+ * definition (`buf`) and adding it to the list of macros. The macro will
+ * be available for expansion during the preprocessing phase.
+ *
+ * @param name The name of the macro to define.
+ * @param buf The definition of the macro as a string, which will be tokenized.
+ */
+void define_macro(char *name, char *buf)
+{
+	Token *tok = tokenize(new_file("<built-in>", 1, buf));
+
+	add_macro(name, true, tok);
 }
 
-void undef_macro(char *name) {
-  hashmap_delete(&macros, name);
+/**
+ * @brief Undefines a macro by name.
+ *
+ * This function removes a macro definition from the list of macros, making
+ * it unavailable for future expansions.
+ *
+ * @param name The name of the macro to undefine.
+ */
+void undef_macro(char *name)
+{
+	hashmap_delete(&macros, name);
 }
 
-static Macro *add_builtin(char *name, macro_handler_fn *fn) {
-  Macro *m = add_macro(name, true, NULL);
-  m->handler = fn;
-  return m;
+/**
+ * @brief Adds a built-in macro with a handler function.
+ *
+ * This function adds a built-in macro with a handler function that will be
+ * called when the macro is expanded. The handler is specified by the
+ * `macro_handler_fn` function pointer.
+ *
+ * @param name The name of the built-in macro to add.
+ * @param fn A pointer to the handler function for the macro.
+ *
+ * @return The newly added macro.
+ */
+static Macro *add_builtin(char *name, macro_handler_fn *fn)
+{
+	Macro *m = add_macro(name, true, NULL);
+
+	m->handler = fn;
+	return m;
 }
 
-static Token *file_macro(Token *tmpl) {
-  while (tmpl->origin)
-    tmpl = tmpl->origin;
-  return new_str_token(tmpl->file->display_name, tmpl);
+/**
+ * @brief Expands the `__FILE__` macro to the current file's display name.
+ *
+ * This function expands the `__FILE__` macro to a string containing the
+ * name of the file where the macro is used. The function ensures that the
+ * token is traced back to the original source file.
+ *
+ * @param tmpl The token template from which to expand the macro.
+ *
+ * @return A new token representing the expanded `__FILE__` macro.
+ */
+static Token *file_macro(Token *tmpl)
+{
+	while (tmpl->origin)
+		tmpl = tmpl->origin;
+	return new_str_token(tmpl->file->display_name, tmpl);
 }
 
-static Token *line_macro(Token *tmpl) {
-  while (tmpl->origin)
-    tmpl = tmpl->origin;
-  int i = tmpl->line_no + tmpl->file->line_delta;
-  return new_num_token(i, tmpl);
+/**
+ * @brief Expands the `__LINE__` macro to the current line number.
+ *
+ * This function expands the `__LINE__` macro to a token representing the
+ * current line number, adjusted for any line deltas in the file.
+ *
+ * @param tmpl The token template from which to expand the macro.
+ *
+ * @return A new token representing the expanded `__LINE__` macro.
+ */
+static Token *line_macro(Token *tmpl)
+{
+	while (tmpl->origin)
+		tmpl = tmpl->origin;
+	int i = tmpl->line_no + tmpl->file->line_delta;
+	return new_num_token(i, tmpl);
 }
 
-// __COUNTER__ is expanded to serial values starting from 0.
-static Token *counter_macro(Token *tmpl) {
-  static int i = 0;
-  return new_num_token(i++, tmpl);
+/**
+ * @brief Expands the `__COUNTER__` macro to a serial value starting from 0.
+ *
+ * This function expands the `__COUNTER__` macro to a token that represents
+ * a serial value, starting from 0 and incrementing each time the macro is expanded.
+ *
+ * @param tmpl The token template from which to expand the macro.
+ *
+ * @return A new token representing the expanded `__COUNTER__` macro.
+ */
+static Token *counter_macro(Token *tmpl)
+{
+	static int i = 0;
+
+	return new_num_token(i++, tmpl);
 }
 
-// __TIMESTAMP__ is expanded to a string describing the last
-// modification time of the current file. E.g.
-// "Fri Jul 24 01:32:50 2020"
-static Token *timestamp_macro(Token *tmpl) {
-  struct stat st;
-  if (stat(tmpl->file->name, &st) != 0)
-    return new_str_token("??? ??? ?? ??:??:?? ????", tmpl);
+/**
+ * @brief Expands the `__TIMESTAMP__` macro to the last modification time of the current file.
+ *
+ * This function expands the `__TIMESTAMP__` macro to a string representing the
+ * last modification time of the current file, in the format:
+ * "Fri Jul 24 01:32:50 2020". If the file's modification time cannot be determined,
+ * a placeholder string is returned.
+ *
+ * @param tmpl The token template from which to expand the macro.
+ *
+ * @return A new token representing the expanded `__TIMESTAMP__` macro.
+ */
+static Token *timestamp_macro(Token *tmpl)
+{
+	struct stat st;
 
-  char buf[30];
-  ctime_r(&st.st_mtime, buf);
-  buf[24] = '\0';
-  return new_str_token(buf, tmpl);
+	if (stat(tmpl->file->name, &st) != 0)
+		return new_str_token("??? ??? ?? ??:??:?? ????", tmpl);
+
+	char buf[30];
+	ctime_r(&st.st_mtime, buf);
+	buf[24] = '\0';
+	return new_str_token(buf, tmpl);
 }
 
-static Token *base_file_macro(Token *tmpl) {
-  return new_str_token(base_file, tmpl);
+/**
+ * @brief Expands the `__BASE_FILE__` macro to the base file name.
+ *
+ * This function expands the `__BASE_FILE__` macro to the base file name,
+ * which is typically the name of the main source file, ignoring any included files.
+ *
+ * @param tmpl The token template from which to expand the macro.
+ *
+ * @return A new token representing the expanded `__BASE_FILE__` macro.
+ */
+static Token *base_file_macro(Token *tmpl)
+{
+	return new_str_token(base_file, tmpl);
 }
 
-// __DATE__ is expanded to the current date, e.g. "May 17 2020".
-static char *format_date(struct tm *tm) {
-  static char mon[][4] = {
-    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
-    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-  };
+/**
+ * @brief Formats the current date as a string in the format "Mon dd yyyy".
+ *
+ * This function takes a `struct tm` representing the current date and formats
+ * it as a string in the format `"Mon dd yyyy"`, where `Mon` is the three-letter
+ * month abbreviation, `dd` is the day of the month, and `yyyy` is the year.
+ *
+ * @param tm A pointer to the `struct tm` representing the current date.
+ *
+ * @return A formatted string representing the date.
+ */
+static char *format_date(struct tm *tm)
+{
+	static char mon[][4] = {
+		"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+		"Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+	};
 
-  return format("\"%s %2d %d\"", mon[tm->tm_mon], tm->tm_mday, tm->tm_year + 1900);
+	return format("\"%s %2d %d\"", mon[tm->tm_mon], tm->tm_mday, tm->tm_year + 1900);
 }
 
-// __TIME__ is expanded to the current time, e.g. "13:34:03".
-static char *format_time(struct tm *tm) {
-  return format("\"%02d:%02d:%02d\"", tm->tm_hour, tm->tm_min, tm->tm_sec);
+/**
+ * @brief Formats the current time as a string in the format "hh:mm:ss".
+ *
+ * This function takes a `struct tm` representing the current time and formats
+ * it as a string in the format `"hh:mm:ss"`, where `hh` is the hour, `mm` is the
+ * minute, and `ss` is the second.
+ *
+ * @param tm A pointer to the `struct tm` representing the current time.
+ *
+ * @return A formatted string representing the time.
+ */
+static char *format_time(struct tm *tm)
+{
+	return format("\"%02d:%02d:%02d\"", tm->tm_hour, tm->tm_min, tm->tm_sec);
 }
 
-void init_macros(void) {
-  // Define predefined macros
-  define_macro("_LP64", "1");
-  define_macro("__C99_MACRO_WITH_VA_ARGS", "1");
-  define_macro("__ELF__", "1");
-  define_macro("__LP64__", "1");
-  define_macro("__SIZEOF_DOUBLE__", "8");
-  define_macro("__SIZEOF_FLOAT__", "4");
-  define_macro("__SIZEOF_INT__", "4");
-  define_macro("__SIZEOF_LONG_DOUBLE__", "8");
-  define_macro("__SIZEOF_LONG_LONG__", "8");
-  define_macro("__SIZEOF_LONG__", "8");
-  define_macro("__SIZEOF_POINTER__", "8");
-  define_macro("__SIZEOF_PTRDIFF_T__", "8");
-  define_macro("__SIZEOF_SHORT__", "2");
-  define_macro("__SIZEOF_SIZE_T__", "8");
-  define_macro("__SIZE_TYPE__", "unsigned long");
-  define_macro("__STDC_HOSTED__", "1");
-  define_macro("__STDC_NO_COMPLEX__", "1");
-  define_macro("__STDC_UTF_16__", "1");
-  define_macro("__STDC_UTF_32__", "1");
-  define_macro("__STDC_VERSION__", "201112L");
-  define_macro("__STDC__", "1");
-  define_macro("__USER_LABEL_PREFIX__", "");
-  define_macro("__alignof__", "_Alignof");
-  define_macro("__amd64", "1");
-  define_macro("__amd64__", "1");
-  define_macro("__chibicc__", "1");
-  define_macro("__const__", "const");
-  define_macro("__gnu_linux__", "1");
-  define_macro("__inline__", "inline");
-  define_macro("__linux", "1");
-  define_macro("__linux__", "1");
-  define_macro("__signed__", "signed");
-  define_macro("__typeof__", "typeof");
-  define_macro("__unix", "1");
-  define_macro("__unix__", "1");
-  define_macro("__volatile__", "volatile");
-  define_macro("__x86_64", "1");
-  define_macro("__x86_64__", "1");
-  define_macro("linux", "1");
-  define_macro("unix", "1");
+/**
+ * @brief Initializes predefined macros.
+ *
+ * This function defines a set of predefined macros that are commonly used in
+ * C and C++ compilers. These macros are automatically defined during the
+ * preprocessing phase and provide information about the environment, such as
+ * target architecture, operating system, and data type sizes.
+ *
+ * It also registers built-in macros like `__FILE__`, `__LINE__`, `__COUNTER__`,
+ * `__TIMESTAMP__`, and `__BASE_FILE__` to be expanded during preprocessing.
+ *
+ * Additionally, the `__DATE__` and `__TIME__` macros are defined to represent
+ * the current date and time, respectively.
+ */
+void init_macros(void)
+{
+	// Define predefined macros
+	define_macro("_LP64", "1");
+	define_macro("__C99_MACRO_WITH_VA_ARGS", "1");
+	define_macro("__ELF__", "1");
+	define_macro("__LP64__", "1");
+	define_macro("__SIZEOF_DOUBLE__", "8");
+	define_macro("__SIZEOF_FLOAT__", "4");
+	define_macro("__SIZEOF_INT__", "4");
+	define_macro("__SIZEOF_LONG_DOUBLE__", "8");
+	define_macro("__SIZEOF_LONG_LONG__", "8");
+	define_macro("__SIZEOF_LONG__", "8");
+	define_macro("__SIZEOF_POINTER__", "8");
+	define_macro("__SIZEOF_PTRDIFF_T__", "8");
+	define_macro("__SIZEOF_SHORT__", "2");
+	define_macro("__SIZEOF_SIZE_T__", "8");
+	define_macro("__SIZE_TYPE__", "unsigned long");
+	define_macro("__STDC_HOSTED__", "1");
+	define_macro("__STDC_NO_COMPLEX__", "1");
+	define_macro("__STDC_UTF_16__", "1");
+	define_macro("__STDC_UTF_32__", "1");
+	define_macro("__STDC_VERSION__", "201112L");
+	define_macro("__STDC__", "1");
+	define_macro("__USER_LABEL_PREFIX__", "");
+	define_macro("__alignof__", "_Alignof");
+	define_macro("__amd64", "1");
+	define_macro("__amd64__", "1");
+	define_macro("__chibicc__", "1");
+	define_macro("__const__", "const");
+	define_macro("__gnu_linux__", "1");
+	define_macro("__inline__", "inline");
+	define_macro("__linux", "1");
+	define_macro("__linux__", "1");
+	define_macro("__signed__", "signed");
+	define_macro("__typeof__", "typeof");
+	define_macro("__unix", "1");
+	define_macro("__unix__", "1");
+	define_macro("__volatile__", "volatile");
+	define_macro("__x86_64", "1");
+	define_macro("__x86_64__", "1");
+	define_macro("linux", "1");
+	define_macro("unix", "1");
 
-  add_builtin("__FILE__", file_macro);
-  add_builtin("__LINE__", line_macro);
-  add_builtin("__COUNTER__", counter_macro);
-  add_builtin("__TIMESTAMP__", timestamp_macro);
-  add_builtin("__BASE_FILE__", base_file_macro);
+	// Register built-in macros for file, line, counter, timestamp, and base file.
+	add_builtin("__FILE__", file_macro);
+	add_builtin("__LINE__", line_macro);
+	add_builtin("__COUNTER__", counter_macro);
+	add_builtin("__TIMESTAMP__", timestamp_macro);
+	add_builtin("__BASE_FILE__", base_file_macro);
 
-  time_t now = time(NULL);
-  struct tm *tm = localtime(&now);
-  define_macro("__DATE__", format_date(tm));
-  define_macro("__TIME__", format_time(tm));
+	// Define the __DATE__ and __TIME__ macros to represent the current date and time.
+	time_t now = time(NULL);
+	struct tm *tm = localtime(&now);
+	define_macro("__DATE__", format_date(tm));
+	define_macro("__TIME__", format_time(tm));
 }
 
+/**
+ * @brief Enum to represent different kinds of string encodings.
+ *
+ * This enum defines various string encoding types that can be used to specify
+ * the encoding of strings in the program, such as UTF-8, UTF-16, UTF-32, and wide
+ * character strings.
+ */
 typedef enum {
-  STR_NONE, STR_UTF8, STR_UTF16, STR_UTF32, STR_WIDE,
+	STR_NONE,       /**< No string encoding */
+	STR_UTF8,       /**< UTF-8 encoding */
+	STR_UTF16,      /**< UTF-16 encoding */
+	STR_UTF32,      /**< UTF-32 encoding */
+	STR_WIDE,       /**< Wide character encoding */
 } StringKind;
 
-static StringKind getStringKind(Token *tok) {
-  if (!strcmp(tok->loc, "u8"))
-    return STR_UTF8;
+/**
+ * @brief Determines the string kind of a token.
+ *
+ * This function identifies the string encoding type of the provided token.
+ * The token should represent a string literal, and the function checks for
+ * specific prefixes to determine whether it is a UTF-8, UTF-16, UTF-32, wide,
+ * or regular string literal.
+ *
+ * @param tok A pointer to the token that represents a string literal.
+ *
+ * @return A `StringKind` value that indicates the string encoding type of the token.
+ */
+static StringKind getStringKind(Token *tok)
+{
+	if (!strcmp(tok->loc, "u8"))
+		return STR_UTF8;
 
-  switch (tok->loc[0]) {
-  case '"': return STR_NONE;
-  case 'u': return STR_UTF16;
-  case 'U': return STR_UTF32;
-  case 'L': return STR_WIDE;
-  }
-  unreachable();
+	switch (tok->loc[0]) {
+	case '"': return STR_NONE;
+	case 'u': return STR_UTF16;
+	case 'U': return STR_UTF32;
+	case 'L': return STR_WIDE;
+	}
+	unreachable();
 }
 
-// Concatenate adjacent string literals into a single string literal
-// as per the C spec.
-static void join_adjacent_string_literals(Token *tok) {
-  // First pass: If regular string literals are adjacent to wide
-  // string literals, regular string literals are converted to a wide
-  // type before concatenation. In this pass, we do the conversion.
-  for (Token *tok1 = tok; tok1->kind != TK_EOF;) {
-    if (tok1->kind != TK_STR || tok1->next->kind != TK_STR) {
-      tok1 = tok1->next;
-      continue;
-    }
+/**
+ * @brief Joins adjacent string literals into a single string literal.
+ *
+ * This function performs two passes to concatenate adjacent string literals
+ * according to the C specification. In the first pass, the function checks
+ * for string literals of different types and converts them if necessary
+ * (e.g., converting regular string literals to wide string literals).
+ * In the second pass, adjacent string literals are concatenated into one.
+ *
+ * @param tok A pointer to the first token in the list of string literals to be joined.
+ */
+static void join_adjacent_string_literals(Token *tok)
+{
+	// First pass: If regular string literals are adjacent to wide
+	// string literals, regular string literals are converted to a wide
+	// type before concatenation. In this pass, we do the conversion.
+	for (Token *tok1 = tok; tok1->kind != TK_EOF;) {
+		if (tok1->kind != TK_STR || tok1->next->kind != TK_STR) {
+			tok1 = tok1->next;
+			continue;
+		}
 
-    StringKind kind = getStringKind(tok1);
-    Type *basety = tok1->ty->base;
+		StringKind kind = getStringKind(tok1);
+		Type *basety = tok1->ty->base;
 
-    for (Token *t = tok1->next; t->kind == TK_STR; t = t->next) {
-      StringKind k = getStringKind(t);
-      if (kind == STR_NONE) {
-        kind = k;
-        basety = t->ty->base;
-      } else if (k != STR_NONE && kind != k) {
-        error_tok(t, "unsupported non-standard concatenation of string literals");
-      }
-    }
+		for (Token *t = tok1->next; t->kind == TK_STR; t = t->next) {
+			StringKind k = getStringKind(t);
+			if (kind == STR_NONE) {
+				kind = k;
+				basety = t->ty->base;
+			} else if (k != STR_NONE && kind != k) {
+				error_tok(t, "unsupported non-standard concatenation of string literals");
+			}
+		}
 
-    if (basety->size > 1)
-      for (Token *t = tok1; t->kind == TK_STR; t = t->next)
-        if (t->ty->base->size == 1)
-          *t = *tokenize_string_literal(t, basety);
+		if (basety->size > 1)
+			for (Token *t = tok1; t->kind == TK_STR; t = t->next)
+				if (t->ty->base->size == 1)
+					*t = *tokenize_string_literal(t, basety);
 
-    while (tok1->kind == TK_STR)
-      tok1 = tok1->next;
-  }
+		while (tok1->kind == TK_STR)
+			tok1 = tok1->next;
+	}
 
-  // Second pass: concatenate adjacent string literals.
-  for (Token *tok1 = tok; tok1->kind != TK_EOF;) {
-    if (tok1->kind != TK_STR || tok1->next->kind != TK_STR) {
-      tok1 = tok1->next;
-      continue;
-    }
+	// Second pass: concatenate adjacent string literals.
+	for (Token *tok1 = tok; tok1->kind != TK_EOF;) {
+		if (tok1->kind != TK_STR || tok1->next->kind != TK_STR) {
+			tok1 = tok1->next;
+			continue;
+		}
 
-    Token *tok2 = tok1->next;
-    while (tok2->kind == TK_STR)
-      tok2 = tok2->next;
+		Token *tok2 = tok1->next;
+		while (tok2->kind == TK_STR)
+			tok2 = tok2->next;
 
-    int len = tok1->ty->array_len;
-    for (Token *t = tok1->next; t != tok2; t = t->next)
-      len = len + t->ty->array_len - 1;
+		int len = tok1->ty->array_len;
+		for (Token *t = tok1->next; t != tok2; t = t->next)
+			len = len + t->ty->array_len - 1;
 
-    char *buf = calloc(tok1->ty->base->size, len);
+		char *buf = calloc(tok1->ty->base->size, len);
 
-    int i = 0;
-    for (Token *t = tok1; t != tok2; t = t->next) {
-      memcpy(buf + i, t->str, t->ty->size);
-      i = i + t->ty->size - t->ty->base->size;
-    }
+		int i = 0;
+		for (Token *t = tok1; t != tok2; t = t->next) {
+			memcpy(buf + i, t->str, t->ty->size);
+			i = i + t->ty->size - t->ty->base->size;
+		}
 
-    *tok1 = *copy_token(tok1);
-    tok1->ty = array_of(tok1->ty->base, len);
-    tok1->str = buf;
-    tok1->next = tok2;
-    tok1 = tok2;
-  }
+		*tok1 = *copy_token(tok1);
+		tok1->ty = array_of(tok1->ty->base, len);
+		tok1->str = buf;
+		tok1->next = tok2;
+		tok1 = tok2;
+	}
 }
 
-// Entry point function of the preprocessor.
-Token *preprocess(Token *tok) {
-  tok = preprocess2(tok);
-  if (cond_incl)
-    error_tok(cond_incl->tok, "unterminated conditional directive");
-  convert_pp_tokens(tok);
-  join_adjacent_string_literals(tok);
+/**
+ * @brief Entry point function of the preprocessor.
+ *
+ * This function serves as the main entry point for the preprocessing phase of
+ * the compiler. It processes the given token stream by evaluating all preprocessing
+ * directives, expanding macros, handling conditional inclusions, and performing other
+ * transformations as defined by the C preprocessor. It also resolves adjacent
+ * string literals and updates line numbers in the token stream.
+ *
+ * @param tok A pointer to the first token in the input stream to be preprocessed.
+ *
+ * @return A pointer to the first token in the transformed token stream after preprocessing.
+ */
+Token *preprocess(Token *tok)
+{
+	tok = preprocess2(tok);
+	if (cond_incl)
+		error_tok(cond_incl->tok, "unterminated conditional directive");
+	convert_pp_tokens(tok);
+	join_adjacent_string_literals(tok);
 
-  for (Token *t = tok; t; t = t->next)
-    t->line_no += t->line_delta;
-  return tok;
+	for (Token *t = tok; t; t = t->next)
+		t->line_no += t->line_delta;
+	return tok;
 }
