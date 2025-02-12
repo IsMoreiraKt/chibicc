@@ -70,7 +70,7 @@ clean:
 
 # Format the source code with Uncrustify
 format: 
-	$(UNCRUSTIFY) $(UNCRUSTIFY_OPTS) --no-backup $(wildcard *.c *.h)
+	$(UNCRUSTIFY) $(UNCRUSTIFY_OPTS) --no-backup $(SRCS)
 
 # Create build directory and move all compiled files there
 build: $(OBJS) chibicc
